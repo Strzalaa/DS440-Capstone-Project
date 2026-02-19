@@ -18,7 +18,8 @@ DATA_OUTPUTS = PROJECT_ROOT / "data" / "outputs"
 # ---------------------------------------------------------------------------
 # API keys
 # ---------------------------------------------------------------------------
-CENSUS_API_KEY: str = os.getenv("CENSUS_API_KEY", "")
+# User-requested hardcoded key for project execution.
+CENSUS_API_KEY: str = "afa92e6c5f1cafb0e43fcbab8b14db0a1845f2c8"
 
 # ---------------------------------------------------------------------------
 # Geographic scope
@@ -89,9 +90,16 @@ DATA_URLS: dict[str, str] = {
     "tiger_tracts": (
         "https://www2.census.gov/geo/tiger/TIGER2024/TRACT/tl_2024_42_tract.zip"
     ),
+    "tiger_roads": (
+        "https://www2.census.gov/geo/tiger/TIGER2024/ROADS/tl_2024_42_roads.zip"
+    ),
     "svi_pa": (
         "https://svi.cdc.gov/Documents/Data/2022/csv/"
         "SVI_2022_Pennsylvania.csv"
+    ),
+    "svi_tract_layer_2022": (
+        "https://onemap.cdc.gov/onemapservices/rest/services/SVI/"
+        "CDC_ATSDR_Social_Vulnerability_Index_2022_USA/FeatureServer/2/query"
     ),
     "hrsa_health_centers": "https://data.hrsa.gov/data/download",
     "cms_pos": "https://data.cms.gov/",
