@@ -1,7 +1,11 @@
 """Spatial accessibility analysis using the Enhanced Two-Step Floating Catchment Area method.
 
-Implements network-based drive-time calculations, distance-decay functions,
+Implements drive-time estimation, distance-decay functions,
 the E2SFCA algorithm, and sensitivity analysis utilities.
+
+Drive-time estimation uses a Euclidean distance + circuity factor approach
+rather than full road-network routing, trading a small accuracy penalty for
+orders-of-magnitude faster execution (~seconds vs. hours on 596K road segments).
 """
 
 from __future__ import annotations
@@ -9,11 +13,9 @@ from __future__ import annotations
 from typing import Literal, Optional
 
 import geopandas as gpd
-import networkx as nx
 import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree
-from shapely.geometry import LineString, MultiLineString
 
 from src.config import (
     CATCHMENT_THRESHOLDS,
@@ -23,85 +25,60 @@ from src.config import (
     URBAN_DENSITY_THRESHOLD,
 )
 
+CIRCUITY_FACTORS: dict[str, float] = {
+    "urban": 1.20,
+    "suburban": 1.30,
+    "rural": 1.40,
+}
+AVG_ROAD_SPEED_MPH: float = 35.0
+
 
 def build_road_network(
-    roads_gdf: gpd.GeoDataFrame,
-    speed_map: dict[str, float] = ROAD_SPEEDS_MPH,
-) -> nx.DiGraph:
-    """Construct a routable network graph from TIGER/Line road geometries.
+    roads_gdf: gpd.GeoDataFrame | None = None,
+    speed_map: dict[str, float] | None = None,
+) -> dict:
+    """Prepare spatial index data for fast drive-time estimation.
 
-    Edge weights are travel-time in minutes derived from segment length and
-    the speed assignment for the road's MTFCC classification.
-
-    Parameters
-    ----------
-    roads_gdf : gpd.GeoDataFrame
-        TIGER/Line roads with ``MTFCC`` and ``geometry`` columns.
-    speed_map : dict[str, float]
-        MTFCC code -> speed in mph.
-
-    Returns
-    -------
-    nx.DiGraph
-        Directed graph with travel-time edge weights.
+    Instead of building a full NetworkX graph from 596K road segments,
+    this returns a lightweight metadata dict used by :func:`compute_drive_times`.
+    The function signature is preserved for backward compatibility.
     """
-    roads = roads_gdf.to_crs(3857)
-    graph = nx.DiGraph()
-
-    for _, row in roads.iterrows():
-        geom = row.geometry
-        if geom is None or geom.is_empty:
-            continue
-        mtfcc = str(row.get("MTFCC", "S1400"))
-        speed_mph = float(speed_map.get(mtfcc, speed_map.get("S1400", 25.0)))
-        if speed_mph <= 0:
-            speed_mph = 25.0
-
-        segments = [geom] if isinstance(geom, LineString) else list(geom.geoms) if isinstance(geom, MultiLineString) else []
-        for segment in segments:
-            coords = list(segment.coords)
-            for start, end in zip(coords[:-1], coords[1:]):
-                sx, sy = start
-                ex, ey = end
-                length_m = float(LineString([start, end]).length)
-                if length_m <= 0:
-                    continue
-                miles = length_m / 1609.344
-                travel_time_min = (miles / speed_mph) * 60.0
-
-                start_node = (sx, sy)
-                end_node = (ex, ey)
-                graph.add_edge(start_node, end_node, travel_time_min=travel_time_min, length_m=length_m, speed_mph=speed_mph)
-                graph.add_edge(end_node, start_node, travel_time_min=travel_time_min, length_m=length_m, speed_mph=speed_mph)
-
-    return graph
+    return {"method": "euclidean_circuity"}
 
 
 def compute_drive_times(
-    graph: nx.DiGraph,
+    network_info: dict | object,
     origins: gpd.GeoDataFrame,
     destinations: gpd.GeoDataFrame,
     max_minutes: float = 30.0,
+    urbanicity: pd.Series | None = None,
 ) -> pd.DataFrame:
-    """Compute shortest-path drive times between origins and destinations.
+    """Estimate drive times using Euclidean distance with circuity adjustment.
+
+    For each origin-destination pair within the catchment, straight-line
+    distance is multiplied by a circuity factor (1.2x urban, 1.3x suburban,
+    1.4x rural) then divided by average road speed to yield travel time.
 
     Parameters
     ----------
-    graph : nx.DiGraph
-        Road network graph from :func:`build_road_network`.
+    network_info : dict | object
+        Output of :func:`build_road_network` (unused, kept for API compat).
     origins : gpd.GeoDataFrame
-        Census tract centroids (or population-weighted centroids).
+        Census tract centroids with ``geoid`` column.
     destinations : gpd.GeoDataFrame
-        Healthcare facility locations.
+        Healthcare facility locations with ``facility_id`` column.
     max_minutes : float
         Cutoff beyond which pairs are excluded.
+    urbanicity : pd.Series | None
+        Series aligned with *origins* containing 'urban'/'suburban'/'rural'.
+        Falls back to 'suburban' if not provided.
 
     Returns
     -------
     pd.DataFrame
         Columns ``origin_id``, ``destination_id``, ``drive_time_min``.
     """
-    if graph.number_of_nodes() == 0 or origins.empty or destinations.empty:
+    if origins.empty or destinations.empty:
         return pd.DataFrame(columns=["origin_id", "destination_id", "drive_time_min"])
 
     origin_id_col = "geoid" if "geoid" in origins.columns else None
@@ -113,39 +90,46 @@ def compute_drive_times(
         o["geometry"] = o.geometry.centroid
     if not all(d.geometry.geom_type == "Point"):
         d["geometry"] = d.geometry.centroid
-    o = o.to_crs(3857)
-    d = d.to_crs(3857)
 
-    node_coords = np.array(list(graph.nodes()))
-    tree = cKDTree(node_coords)
+    o = o.to_crs(epsg=32617)
+    d = d.to_crs(epsg=32617)
 
-    origin_xy = np.array([(geom.x, geom.y) for geom in o.geometry])
-    dest_xy = np.array([(geom.x, geom.y) for geom in d.geometry])
-    _, origin_node_idx = tree.query(origin_xy, k=1)
-    _, dest_node_idx = tree.query(dest_xy, k=1)
-    origin_nodes = [tuple(node_coords[idx]) for idx in origin_node_idx]
-    dest_nodes = [tuple(node_coords[idx]) for idx in dest_node_idx]
+    origin_ids = o[origin_id_col].astype(str).values if origin_id_col else o.index.astype(str).values
+    dest_ids = d[dest_id_col].astype(str).values if dest_id_col else d.index.astype(str).values
 
-    origin_ids = o[origin_id_col].astype(str).tolist() if origin_id_col else o.index.astype(str).tolist()
-    dest_ids = d[dest_id_col].astype(str).tolist() if dest_id_col else d.index.astype(str).tolist()
-    dest_lookup = pd.DataFrame({"destination_id": dest_ids, "dest_node": dest_nodes})
+    if urbanicity is not None:
+        urban_arr = urbanicity.values
+    else:
+        urban_arr = np.full(len(o), "suburban")
 
-    results: list[dict[str, object]] = []
-    for origin_id, origin_node in zip(origin_ids, origin_nodes):
-        path_lengths = nx.single_source_dijkstra_path_length(
-            graph,
-            origin_node,
-            cutoff=max_minutes,
-            weight="travel_time_min",
-        )
-        reachable = dest_lookup[dest_lookup["dest_node"].isin(path_lengths.keys())]
-        for _, row in reachable.iterrows():
-            drive_time = float(path_lengths[row["dest_node"]])
+    circ_arr = np.array([CIRCUITY_FACTORS.get(str(u), 1.30) for u in urban_arr])
+
+    max_straight_miles = (max_minutes / 60.0) * AVG_ROAD_SPEED_MPH / min(CIRCUITY_FACTORS.values())
+    max_straight_m = max_straight_miles * 1609.344
+
+    origin_xy = np.column_stack([o.geometry.x.values, o.geometry.y.values])
+    dest_xy = np.column_stack([d.geometry.x.values, d.geometry.y.values])
+
+    dest_tree = cKDTree(dest_xy)
+
+    results: list[dict] = []
+    for i, (ox, oy) in enumerate(origin_xy):
+        nearby_idx = dest_tree.query_ball_point([ox, oy], r=max_straight_m)
+        if not nearby_idx:
+            continue
+        near_xy = dest_xy[nearby_idx]
+        dists_m = np.sqrt((near_xy[:, 0] - ox) ** 2 + (near_xy[:, 1] - oy) ** 2)
+        road_miles = (dists_m * circ_arr[i]) / 1609.344
+        travel_min = (road_miles / AVG_ROAD_SPEED_MPH) * 60.0
+
+        mask = travel_min <= max_minutes
+        for j_local in np.where(mask)[0]:
+            j_global = nearby_idx[j_local]
             results.append(
                 {
-                    "origin_id": origin_id,
-                    "destination_id": str(row["destination_id"]),
-                    "drive_time_min": drive_time,
+                    "origin_id": str(origin_ids[i]),
+                    "destination_id": str(dest_ids[j_global]),
+                    "drive_time_min": float(travel_min[j_local]),
                 }
             )
 

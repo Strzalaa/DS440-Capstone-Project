@@ -20,12 +20,15 @@ import geopandas as gpd
 import pandas as pd
 import requests
 
+import time
+
 from src.config import (
     ACS_VARIABLES,
     CENSUS_API_KEY,
     DATA_RAW,
     DATA_URLS,
     STATE_FIPS,
+    STATE_ABBR,
 )
 
 
@@ -105,89 +108,158 @@ def _normalise_facility_columns(df: pd.DataFrame, source: str) -> pd.DataFrame:
     return out[keep_cols]
 
 
+def _fetch_npi_facilities(
+    state: str,
+    taxonomy_descriptions: list[str],
+    source_label: str,
+    limit_per_taxonomy: int = 200,
+) -> pd.DataFrame:
+    """Fetch healthcare facility records from the NPI Registry API.
+
+    The NPI Registry is a public CMS API that returns provider/organization
+    records including addresses.  We query by state and taxonomy description,
+    then deduplicate on NPI number.
+    """
+    api_url = "https://npiregistry.cms.hhs.gov/api/"
+    all_records: list[dict] = []
+    seen_npi: set[str] = set()
+
+    for taxonomy in taxonomy_descriptions:
+        skip = 0
+        page_size = 200
+        while True:
+            params = {
+                "version": "2.1",
+                "state": state,
+                "enumeration_type": "NPI-2",
+                "taxonomy_description": taxonomy,
+                "limit": str(min(page_size, limit_per_taxonomy - skip)),
+                "skip": str(skip),
+            }
+            try:
+                resp = requests.get(api_url, params=params, timeout=30)
+                resp.raise_for_status()
+                payload = resp.json()
+            except Exception:
+                break
+
+            results = payload.get("results", [])
+            if not results:
+                break
+
+            for r in results:
+                npi = str(r.get("number", ""))
+                if npi in seen_npi:
+                    continue
+                seen_npi.add(npi)
+                basic = r.get("basic", {})
+                addresses = r.get("addresses", [])
+                practice_addr = next(
+                    (a for a in addresses if a.get("address_purpose") == "LOCATION"),
+                    addresses[0] if addresses else {},
+                )
+                all_records.append(
+                    {
+                        "npi": npi,
+                        "facility_name": basic.get("organization_name", "Unknown"),
+                        "address": practice_addr.get("address_1", ""),
+                        "city": practice_addr.get("city", ""),
+                        "state": practice_addr.get("state", state),
+                        "zip": practice_addr.get("postal_code", "")[:5],
+                        "latitude": None,
+                        "longitude": None,
+                        "taxonomy": taxonomy,
+                        "provider_count": 1.0,
+                    }
+                )
+
+            skip += len(results)
+            if skip >= limit_per_taxonomy or len(results) < page_size:
+                break
+            time.sleep(0.3)
+
+    df = pd.DataFrame(all_records)
+    if df.empty:
+        return _normalise_facility_columns(pd.DataFrame(), source=source_label)
+    return _normalise_facility_columns(df, source=source_label)
+
+
 def download_cms_data(output_dir: Path = DATA_RAW) -> pd.DataFrame:
-    """Download CMS Provider of Services file and return as DataFrame.
+    """Download hospital facility data via the NPI Registry API.
 
-    Parameters
-    ----------
-    output_dir : Path
-        Directory to save the raw download.
-
-    Returns
-    -------
-    pd.DataFrame
-        Facility records with name, address, coordinates, and type.
+    Falls back to a local file in ``data/raw/cms/`` if one exists.
     """
     out_dir = output_dir / "cms"
     _ensure_dir(out_dir)
+    out_path = out_dir / "cms_facilities_standardized.csv"
 
     candidates = sorted(
-        [
-            *out_dir.glob("*.csv"),
-            *out_dir.glob("*.xlsx"),
-            *out_dir.glob("*.xls"),
-            *out_dir.glob("*.txt"),
-            *out_dir.glob("*.tsv"),
-        ],
+        [f for f in out_dir.glob("*.csv") if f.name != "cms_facilities_standardized.csv"]
+        + [*out_dir.glob("*.xlsx"), *out_dir.glob("*.xls")],
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
-    if not candidates:
-        warnings.warn(
-            "No CMS raw file found in data/raw/cms. Returning an empty template "
-            "DataFrame; place the CMS POS file in this folder to populate it.",
-            stacklevel=2,
-        )
-        template = _normalise_facility_columns(pd.DataFrame(), source="cms")
-        template.to_csv(out_dir / "cms_facilities_standardized.csv", index=False)
-        return template
+    if candidates:
+        cms_df = _load_tabular(candidates[0])
+        cms_df = _normalise_facility_columns(cms_df, source="cms")
+        cms_df.to_csv(out_path, index=False)
+        return cms_df
 
-    cms_df = _load_tabular(candidates[0])
-    cms_df = _normalise_facility_columns(cms_df, source="cms")
-    cms_df.to_csv(out_dir / "cms_facilities_standardized.csv", index=False)
+    print("Fetching PA hospital facilities from NPI Registry...")
+    cms_df = _fetch_npi_facilities(
+        state=STATE_ABBR,
+        taxonomy_descriptions=[
+            "General Acute Care Hospital",
+            "Critical Access Hospital",
+            "Rehabilitation Hospital",
+            "Psychiatric Hospital",
+            "Long Term Care Hospital",
+        ],
+        source_label="cms",
+        limit_per_taxonomy=200,
+    )
+    cms_df.to_csv(out_path, index=False)
+    print(f"  Saved {len(cms_df)} hospital records to {out_path}")
     return cms_df
 
 
 def download_hrsa_data(output_dir: Path = DATA_RAW) -> pd.DataFrame:
-    """Download HRSA Health Center site data.
+    """Download health center / FQHC data via the NPI Registry API.
 
-    Parameters
-    ----------
-    output_dir : Path
-        Directory to save the raw download.
-
-    Returns
-    -------
-    pd.DataFrame
-        Health center records with coordinates.
+    Falls back to a local file in ``data/raw/hrsa/`` if one exists.
     """
     out_dir = output_dir / "hrsa"
     _ensure_dir(out_dir)
+    out_path = out_dir / "hrsa_facilities_standardized.csv"
 
     candidates = sorted(
-        [
-            *out_dir.glob("*.csv"),
-            *out_dir.glob("*.xlsx"),
-            *out_dir.glob("*.xls"),
-            *out_dir.glob("*.txt"),
-            *out_dir.glob("*.tsv"),
-        ],
+        [f for f in out_dir.glob("*.csv") if f.name != "hrsa_facilities_standardized.csv"]
+        + [*out_dir.glob("*.xlsx"), *out_dir.glob("*.xls")],
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
-    if not candidates:
-        warnings.warn(
-            "No HRSA raw file found in data/raw/hrsa. Returning an empty template "
-            "DataFrame; place the HRSA file in this folder to populate it.",
-            stacklevel=2,
-        )
-        template = _normalise_facility_columns(pd.DataFrame(), source="hrsa")
-        template.to_csv(out_dir / "hrsa_facilities_standardized.csv", index=False)
-        return template
+    if candidates:
+        hrsa_df = _load_tabular(candidates[0])
+        hrsa_df = _normalise_facility_columns(hrsa_df, source="hrsa")
+        hrsa_df.to_csv(out_path, index=False)
+        return hrsa_df
 
-    hrsa_df = _load_tabular(candidates[0])
-    hrsa_df = _normalise_facility_columns(hrsa_df, source="hrsa")
-    hrsa_df.to_csv(out_dir / "hrsa_facilities_standardized.csv", index=False)
+    print("Fetching PA health centers from NPI Registry...")
+    hrsa_df = _fetch_npi_facilities(
+        state=STATE_ABBR,
+        taxonomy_descriptions=[
+            "Federally Qualified Health Center",
+            "Community Health Center",
+            "Clinic/Center",
+            "Family Medicine",
+            "Internal Medicine",
+            "Pediatrics",
+        ],
+        source_label="hrsa",
+        limit_per_taxonomy=200,
+    )
+    hrsa_df.to_csv(out_path, index=False)
+    print(f"  Saved {len(hrsa_df)} health center records to {out_path}")
     return hrsa_df
 
 

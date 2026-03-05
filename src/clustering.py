@@ -53,7 +53,10 @@ def prepare_features(
     if not cols:
         raise ValueError("No usable feature columns found for clustering.")
 
-    matrix = data[cols].replace([np.inf, -np.inf], np.nan).fillna(data[cols].median(numeric_only=True))
+    matrix = data[cols].copy()
+    for c in matrix.columns:
+        matrix[c] = pd.to_numeric(matrix[c], errors="coerce")
+    matrix = matrix.replace([np.inf, -np.inf], np.nan).fillna(matrix.median(numeric_only=True)).fillna(0.0)
     X = matrix.to_numpy(dtype=float)
     if scale:
         X = StandardScaler().fit_transform(X)
@@ -219,7 +222,10 @@ def characterize_clusters(
     if not cols:
         raise ValueError("No feature columns available to characterize clusters.")
 
-    grouped = data.groupby(label_col, dropna=False)
+    work = data.copy()
+    for c in cols:
+        work[c] = pd.to_numeric(work[c], errors="coerce")
+    grouped = work.groupby(label_col, dropna=False)
     summary = grouped[cols].agg(["mean", "median"])
     summary.columns = [f"{col}_{stat}" for col, stat in summary.columns]
     summary["n_tracts"] = grouped.size()

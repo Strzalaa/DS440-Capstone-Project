@@ -101,7 +101,6 @@ def demographic_overlay(
     """
     work = tracts.to_crs(4326).copy().reset_index(drop=True)
     work["_row_id"] = work.index.astype(str)
-    layer = folium.FeatureGroup(name=label, show=False)
     choropleth = folium.Choropleth(
         geo_data=work.__geo_interface__,
         data=work,
@@ -112,9 +111,10 @@ def demographic_overlay(
         line_opacity=0.1,
         legend_name=label,
         nan_fill_color="lightgray",
+        name=label,
+        show=False,
     )
-    choropleth.add_to(layer)
-    layer.add_to(base_map)
+    choropleth.add_to(base_map)
     folium.LayerControl().add_to(base_map)
     return base_map
 

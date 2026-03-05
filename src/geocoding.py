@@ -45,6 +45,74 @@ def _census_geocode_oneline(address: str, timeout: int = 15) -> tuple[Optional[f
         return None, None
 
 
+def _census_batch_geocode(df: pd.DataFrame, address_col: str, city_col: str,
+                          state_col: str, zip_col: str,
+                          batch_size: int = 1000) -> pd.DataFrame:
+    """Batch geocode via the Census Bureau batch endpoint (up to 10K per call).
+
+    Returns a copy of df with 'latitude' and 'longitude' filled where possible.
+    """
+    import io
+    import csv
+    import time as _time
+
+    to_geocode = df[df["latitude"].isna() | df["longitude"].isna()].copy()
+    if to_geocode.empty:
+        return df
+
+    result_df = df.copy()
+    url = "https://geocoding.geo.census.gov/geocoder/locations/addressbatch"
+
+    for start in range(0, len(to_geocode), batch_size):
+        chunk = to_geocode.iloc[start : start + batch_size]
+        csv_buf = io.StringIO()
+        writer = csv.writer(csv_buf)
+        for idx, row in chunk.iterrows():
+            writer.writerow([
+                idx,
+                str(row.get(address_col, "") or "").strip(),
+                str(row.get(city_col, "") or "").strip(),
+                str(row.get(state_col, "") or "").strip(),
+                str(row.get(zip_col, "") or "").strip()[:5],
+            ])
+        csv_bytes = csv_buf.getvalue().encode("utf-8")
+        try:
+            resp = requests.post(
+                url,
+                files={"addressFile": ("addresses.csv", csv_bytes, "text/csv")},
+                data={"benchmark": "Public_AR_Current"},
+                timeout=300,
+            )
+            resp.raise_for_status()
+            reader = csv.reader(io.StringIO(resp.text))
+            for row_data in reader:
+                if len(row_data) < 6:
+                    continue
+                row_id = row_data[0].strip()
+                if not row_id.isdigit():
+                    continue
+                row_idx = int(row_id)
+                match_status = row_data[2].strip() if len(row_data) > 2 else ""
+                if match_status.lower() != "match":
+                    continue
+                coord_field = row_data[5].strip() if len(row_data) > 5 else ""
+                try:
+                    lon_str, lat_str = coord_field.split(",", 1)
+                    lat = float(lat_str.strip())
+                    lon = float(lon_str.strip())
+                    result_df.at[row_idx, "latitude"] = lat
+                    result_df.at[row_idx, "longitude"] = lon
+                    result_df.at[row_idx, "geocode_status"] = "batch_geocoded"
+                except (ValueError, IndexError):
+                    continue
+        except Exception:
+            pass
+        if start + batch_size < len(to_geocode):
+            _time.sleep(1)
+
+    return result_df
+
+
 def geocode_facilities(
     facilities: pd.DataFrame,
     address_col: str = "address",
@@ -54,8 +122,8 @@ def geocode_facilities(
 ) -> gpd.GeoDataFrame:
     """Geocode facility addresses to point geometries.
 
-    Uses the Census Bureau geocoder as the primary service.  Falls back to
-    coordinates already present in the source data when available.
+    Uses the Census Bureau batch geocoder for efficiency, then falls back to
+    the single-address endpoint for any remaining failures.
 
     Parameters
     ----------
@@ -70,8 +138,10 @@ def geocode_facilities(
         Input records with added ``geometry`` column (EPSG:4326).
     """
     df = facilities.copy()
-    columns = list(df.columns)
+    if df.empty:
+        return gpd.GeoDataFrame(df, geometry=[], crs="EPSG:4326")
 
+    columns = list(df.columns)
     lat_col = _pick_column(columns, ["latitude", "lat", "y"])
     lon_col = _pick_column(columns, ["longitude", "lon", "lng", "x"])
 
@@ -88,23 +158,30 @@ def geocode_facilities(
     has_source_coords = df["latitude"].notna() & df["longitude"].notna()
     df.loc[has_source_coords, "geocode_status"] = "provided"
 
-    missing_coords = ~has_source_coords
-    if missing_coords.any():
-        address_pieces = []
-        for _, row in df.iterrows():
-            address_pieces.append(
-                ", ".join(
-                    str(row.get(col, "")).strip()
-                    for col in [address_col, city_col, state_col, zip_col]
-                    if str(row.get(col, "")).strip()
+    n_missing = (~has_source_coords).sum()
+    if n_missing > 0:
+        print(f"  Batch geocoding {n_missing} facilities via Census API...")
+        df = _census_batch_geocode(df, address_col, city_col, state_col, zip_col)
+        still_missing = df["latitude"].isna() | df["longitude"].isna()
+        n_still = still_missing.sum()
+        print(f"  Batch geocoded {n_missing - n_still} / {n_missing} facilities")
+        if n_still > 0 and n_still <= 50:
+            print(f"  Single-address fallback for {n_still} remaining...")
+            address_pieces = []
+            for _, row in df.iterrows():
+                address_pieces.append(
+                    ", ".join(
+                        str(row.get(col, "")).strip()
+                        for col in [address_col, city_col, state_col, zip_col]
+                        if str(row.get(col, "")).strip()
+                    )
                 )
-            )
-        for idx in df.index[missing_coords]:
-            lat, lon = _census_geocode_oneline(address_pieces[idx])
-            if lat is not None and lon is not None:
-                df.at[idx, "latitude"] = lat
-                df.at[idx, "longitude"] = lon
-                df.at[idx, "geocode_status"] = "geocoded"
+            for idx in df.index[still_missing]:
+                lat, lon = _census_geocode_oneline(address_pieces[idx])
+                if lat is not None and lon is not None:
+                    df.at[idx, "latitude"] = lat
+                    df.at[idx, "longitude"] = lon
+                    df.at[idx, "geocode_status"] = "geocoded"
 
     geometry = [
         Point(lon, lat) if pd.notna(lat) and pd.notna(lon) else None
@@ -207,27 +284,35 @@ def cross_reference_sources(
     cms["cms_idx"] = cms.index
     hrsa["hrsa_idx"] = hrsa.index
 
-    cms_3857 = cms.to_crs(3857)
-    hrsa_3857 = hrsa.to_crs(3857)
-    nearest = gpd.sjoin_nearest(
-        cms_3857,
-        hrsa_3857[["hrsa_idx", "geometry"]],
-        how="left",
-        max_distance=match_threshold_m,
-        distance_col="match_distance_m",
-    )
+    cms_valid = cms[cms.geometry.notna() & ~cms.geometry.is_empty].copy()
+    hrsa_valid = hrsa[hrsa.geometry.notna() & ~hrsa.geometry.is_empty].copy()
 
-    matched_hrsa_idxs = set(nearest["hrsa_idx"].dropna().astype(int).tolist())
+    matched_hrsa_idxs: set[int] = set()
+    if not cms_valid.empty and not hrsa_valid.empty:
+        cms_3857 = cms_valid.to_crs(3857)
+        hrsa_3857 = hrsa_valid.to_crs(3857)
+        nearest = gpd.sjoin_nearest(
+            cms_3857,
+            hrsa_3857[["hrsa_idx", "geometry"]],
+            how="left",
+            max_distance=match_threshold_m,
+            distance_col="match_distance_m",
+        )
+        nearest_dedup = nearest[~nearest.index.duplicated(keep="first")]
+        matched_hrsa_idxs = set(nearest_dedup["hrsa_idx"].dropna().astype(int).tolist())
+        match_mask = nearest_dedup["hrsa_idx"].notna()
+        cms.loc[match_mask.index[match_mask], "source_provenance"] = "cms+hrsa"
+
     merged = cms.copy()
-    merged["source_provenance"] = "cms"
-    merged.loc[nearest["hrsa_idx"].notna().values, "source_provenance"] = "cms+hrsa"
+    if "source_provenance" not in merged.columns:
+        merged["source_provenance"] = "cms"
+    merged["source_provenance"] = merged["source_provenance"].fillna("cms")
 
     unmatched_hrsa = hrsa.loc[~hrsa["hrsa_idx"].isin(matched_hrsa_idxs)].copy()
     unmatched_hrsa["source_provenance"] = "hrsa"
 
     out = pd.concat([merged, unmatched_hrsa], ignore_index=True, sort=False)
-    if "cms_idx" in out.columns:
-        out = out.drop(columns=["cms_idx"])
-    if "hrsa_idx" in out.columns:
-        out = out.drop(columns=["hrsa_idx"])
+    for drop_col in ["cms_idx", "hrsa_idx"]:
+        if drop_col in out.columns:
+            out = out.drop(columns=[drop_col])
     return gpd.GeoDataFrame(out, geometry="geometry", crs="EPSG:4326")

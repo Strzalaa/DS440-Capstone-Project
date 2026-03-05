@@ -42,10 +42,9 @@ def run_ols_regression(
     """
     default_vars = [
         "median_household_income",
-        "pct_uninsured",
         "pct_no_vehicle",
         "svi_overall",
-        "population_density_sq_mi",
+        "pop_density_sq_mi",
     ]
     predictors = independent_vars or [col for col in default_vars if col in data.columns]
     if not predictors:
@@ -117,10 +116,9 @@ def run_gwr(
 
     default_vars = [
         "median_household_income",
-        "pct_uninsured",
         "pct_no_vehicle",
         "svi_overall",
-        "population_density_sq_mi",
+        "pop_density_sq_mi",
     ]
     predictors = independent_vars or [col for col in default_vars if col in data.columns]
     if not predictors:
