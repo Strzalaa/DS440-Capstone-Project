@@ -319,6 +319,43 @@ def fetch_acs_data(
     df["tract"] = df["tract"].astype(str).str.zfill(6)
     df["geoid"] = df["state"] + df["county"] + df["tract"]
 
+    # Fetch pct_uninsured from the ACS Data Profile endpoint (DP03_0099PE)
+    profile_params = {
+        "get": "DP03_0099PE",
+        "for": "tract:*",
+        "in": f"state:{state_fips} county:*",
+        "key": CENSUS_API_KEY,
+    }
+    profile_url = (
+        f"https://api.census.gov/data/{year}/acs/acs5/profile"
+        f"?{urlencode(profile_params)}"
+    )
+    try:
+        profile_resp = requests.get(profile_url, timeout=120)
+        profile_resp.raise_for_status()
+        profile_payload = profile_resp.json()
+        if profile_payload and len(profile_payload) >= 2:
+            p_header = profile_payload[0]
+            p_rows = profile_payload[1:]
+            profile_df = pd.DataFrame(p_rows, columns=p_header)
+            profile_df["state"] = profile_df["state"].astype(str).str.zfill(2)
+            profile_df["county"] = profile_df["county"].astype(str).str.zfill(3)
+            profile_df["tract"] = profile_df["tract"].astype(str).str.zfill(6)
+            profile_df["geoid"] = (
+                profile_df["state"] + profile_df["county"] + profile_df["tract"]
+            )
+            profile_df["pct_uninsured"] = pd.to_numeric(
+                profile_df["DP03_0099PE"], errors="coerce"
+            )
+            df = df.merge(
+                profile_df[["geoid", "pct_uninsured"]], on="geoid", how="left"
+            )
+            print(f"  Fetched pct_uninsured for {profile_df['pct_uninsured'].notna().sum()} tracts")
+    except Exception as exc:
+        warnings.warn(f"Could not fetch DP03 profile data: {exc}")
+        if "pct_uninsured" not in df.columns:
+            df["pct_uninsured"] = pd.NA
+
     out_dir = output_dir / "acs"
     _ensure_dir(out_dir)
     out_path = out_dir / f"acs_{year}_tract_{state_fips}.csv"
