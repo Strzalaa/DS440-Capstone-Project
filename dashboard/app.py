@@ -19,6 +19,9 @@ import plotly.graph_objects as go
 DATA_OUTPUTS = Path(__file__).resolve().parent.parent / "data" / "outputs"
 DATA_PROCESSED = Path(__file__).resolve().parent.parent / "data" / "processed"
 
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
 
 def _load_data():
     clusters_path = DATA_OUTPUTS / "pa_accessibility_clusters.gpkg"
@@ -38,12 +41,10 @@ def _load_data():
         if col in gdf.columns:
             gdf[col] = pd.to_numeric(gdf[col], errors="coerce")
 
-    # Census uses -666666666 as a sentinel for missing income data
     for col in ["median_household_income"]:
         if col in gdf.columns:
             gdf.loc[gdf[col] < 0, col] = np.nan
 
-    # Simplify geometries to reduce browser payload (~35 MB -> ~5 MB)
     gdf["geometry"] = gdf.geometry.simplify(tolerance=0.005, preserve_topology=True)
 
     fac = gpd.read_file(facilities_path).to_crs(4326)
@@ -53,6 +54,10 @@ def _load_data():
 
 tracts_gdf, facilities_gdf = _load_data()
 geojson_data = json.loads(tracts_gdf.to_json())
+
+# ---------------------------------------------------------------------------
+# App setup
+# ---------------------------------------------------------------------------
 
 app = Dash(__name__, title="Healthcare Access Dashboard")
 
@@ -71,7 +76,7 @@ OVERLAY_OPTIONS = [
     {"label": "Population Density (per sq mi)", "value": "pop_density_sq_mi"},
 ]
 
-FRIENDLY_NAMES = {
+FRIENDLY = {
     "accessibility_score": "Accessibility Score",
     "nearest_facility_min": "Drive Time (min)",
     "provider_pop_ratio": "Providers per 1K Pop",
@@ -80,245 +85,297 @@ FRIENDLY_NAMES = {
     "pct_uninsured": "% Uninsured",
     "pct_no_vehicle": "% No Vehicle",
     "svi_overall": "SVI Score",
-    "pop_density_sq_mi": "Pop Density (per sq mi)",
+    "pop_density_sq_mi": "Pop Density (/sq mi)",
+    "none": "None",
 }
 
-app.layout = html.Div(
-    [
-        html.H1(
-            "Healthcare Access Disparities — Pennsylvania",
-            style={"textAlign": "center", "marginBottom": "0.2rem"},
-        ),
+METRIC_COLORSCALES = {
+    "accessibility_score": "Greens",
+    "nearest_facility_min": "OrRd",
+    "provider_pop_ratio": "Blues",
+}
+
+# ---------------------------------------------------------------------------
+# Layout
+# ---------------------------------------------------------------------------
+
+app.layout = html.Div([
+    html.Div([
+        html.H1("Healthcare Access Disparities — Pennsylvania",
+                style={"margin": "0", "fontSize": "1.6rem"}),
         html.P(
             "Interactive explorer for E2SFCA spatial accessibility scores, "
             "demographic overlays, and community typology clusters.",
-            style={"textAlign": "center", "color": "#666"},
+            style={"margin": "0.25rem 0 0 0", "color": "#666", "fontSize": "0.9rem"},
         ),
-        html.Hr(),
-        html.Div(
-            [
-                # Left sidebar
-                html.Div(
-                    [
-                        html.H3("Controls"),
-                        html.Label("Accessibility metric:", style={"fontWeight": "bold"}),
-                        dcc.Dropdown(
-                            id="metric-dropdown",
-                            options=METRIC_OPTIONS,
-                            value="accessibility_score",
-                            clearable=False,
-                        ),
-                        html.Br(),
-                        html.Label("Demographic overlay:", style={"fontWeight": "bold"}),
-                        dcc.Dropdown(
-                            id="overlay-dropdown",
-                            options=OVERLAY_OPTIONS,
-                            value="none",
-                            clearable=False,
-                        ),
-                        html.Br(),
-                        html.Label("Show facilities:", style={"fontWeight": "bold"}),
-                        dcc.Checklist(
-                            id="show-facilities",
-                            options=[{"label": " Facility locations", "value": "show"}],
-                            value=["show"],
-                        ),
-                        html.Hr(),
-                        html.Div(id="summary-stats", style={"fontSize": "0.85rem"}),
-                    ],
-                    style={
-                        "width": "22%", "display": "inline-block",
-                        "verticalAlign": "top", "padding": "1rem",
-                        "backgroundColor": "#f9f9f9", "borderRadius": "8px",
-                    },
-                ),
-                # Main map area
-                html.Div(
-                    [dcc.Graph(id="main-map", style={"height": "80vh"})],
-                    style={"width": "76%", "display": "inline-block", "verticalAlign": "top"},
-                ),
-            ]
-        ),
-    ],
-    style={"fontFamily": "Arial, sans-serif", "margin": "1rem"},
-)
+    ], style={"textAlign": "center", "padding": "0.75rem 0"}),
+
+    html.Hr(style={"margin": "0 0 0.75rem 0"}),
+
+    html.Div([
+        # Sidebar
+        html.Div([
+            html.H3("Controls", style={"marginTop": "0"}),
+
+            html.Label("Accessibility Metric", style={"fontWeight": "600", "fontSize": "0.85rem"}),
+            dcc.Dropdown(id="metric-dropdown", options=METRIC_OPTIONS,
+                         value="accessibility_score", clearable=False,
+                         style={"marginBottom": "0.75rem"}),
+
+            html.Label("Demographic Overlay", style={"fontWeight": "600", "fontSize": "0.85rem"}),
+            dcc.Dropdown(id="overlay-dropdown", options=OVERLAY_OPTIONS,
+                         value="none", clearable=False,
+                         style={"marginBottom": "0.75rem"}),
+
+            dcc.Checklist(
+                id="show-facilities",
+                options=[{"label": " Show facility locations", "value": "show"}],
+                value=["show"],
+                style={"marginBottom": "0.75rem"},
+            ),
+
+            html.Hr(),
+
+            html.Div(id="summary-stats", style={"fontSize": "0.82rem", "lineHeight": "1.5"}),
+
+            html.Div(id="scatter-container", style={"marginTop": "0.75rem"}),
+        ], style={
+            "width": "280px", "minWidth": "280px", "padding": "1rem",
+            "backgroundColor": "#f7f8fa", "borderRadius": "8px",
+            "overflowY": "auto", "maxHeight": "88vh",
+        }),
+
+        # Map
+        html.Div([
+            dcc.Loading(
+                dcc.Graph(id="main-map", style={"height": "85vh"},
+                          config={"scrollZoom": True}),
+                type="circle",
+            ),
+        ], style={"flex": "1", "minWidth": "0"}),
+    ], style={
+        "display": "flex", "gap": "0.75rem", "alignItems": "flex-start",
+    }),
+], style={"fontFamily": "'Segoe UI', Arial, sans-serif", "margin": "0.75rem 1rem"})
 
 
-def _build_hover_text(gdf: gpd.GeoDataFrame) -> list[str]:
-    """Build a rich hover tooltip for each tract."""
+# ---------------------------------------------------------------------------
+# Hover text (precomputed)
+# ---------------------------------------------------------------------------
+
+def _build_hover(gdf, overlay_col=None):
     texts = []
-    for _, row in gdf.iterrows():
-        parts = []
+    for _, r in gdf.iterrows():
+        p = []
         if "geoid" in gdf.columns:
-            parts.append(f"Tract: {row['geoid']}")
+            p.append(f"<b>Tract {r['geoid']}</b>")
         if "accessibility_score" in gdf.columns:
-            parts.append(f"Access Score: {row['accessibility_score']:.6f}")
+            p.append(f"Access Score: {r['accessibility_score']:.6f}")
         if "nearest_facility_min" in gdf.columns:
-            val = row["nearest_facility_min"]
-            parts.append(f"Nearest Facility: {val:.1f} min" if pd.notna(val) else "Nearest Facility: N/A")
-        if "facilities_in_catchment" in gdf.columns:
-            parts.append(f"Facilities in Catchment: {int(row['facilities_in_catchment'])}")
-        if "total_population" in gdf.columns and pd.notna(row.get("total_population")):
-            parts.append(f"Population: {int(row['total_population']):,}")
-        if "median_household_income" in gdf.columns and pd.notna(row.get("median_household_income")):
-            parts.append(f"Median Income: ${int(row['median_household_income']):,}")
-        texts.append("<br>".join(parts))
+            v = r["nearest_facility_min"]
+            p.append(f"Nearest Facility: {v:.1f} min" if pd.notna(v) else "Nearest Facility: N/A")
+        if "facilities_in_catchment" in gdf.columns and pd.notna(r.get("facilities_in_catchment")):
+            p.append(f"Facilities in Catchment: {int(r['facilities_in_catchment'])}")
+        if "total_population" in gdf.columns and pd.notna(r.get("total_population")):
+            p.append(f"Population: {int(r['total_population']):,}")
+        if overlay_col and overlay_col in gdf.columns:
+            ov = r.get(overlay_col)
+            label = FRIENDLY.get(overlay_col, overlay_col)
+            p.append(f"<b>{label}: {ov:.2f}</b>" if pd.notna(ov) else f"{label}: N/A")
+        texts.append("<br>".join(p))
     return texts
 
 
-hover_texts = _build_hover_text(tracts_gdf)
+_hover_cache: dict[str, list[str]] = {}
 
+
+def _get_hover(overlay_col):
+    key = overlay_col or "none"
+    if key not in _hover_cache:
+        _hover_cache[key] = _build_hover(tracts_gdf, overlay_col if overlay_col != "none" else None)
+    return _hover_cache[key]
+
+
+# ---------------------------------------------------------------------------
+# Callback
+# ---------------------------------------------------------------------------
 
 @app.callback(
     Output("main-map", "figure"),
     Output("summary-stats", "children"),
+    Output("scatter-container", "children"),
     Input("metric-dropdown", "value"),
     Input("overlay-dropdown", "value"),
     Input("show-facilities", "value"),
 )
-def update_map(metric: str, overlay: str, show_fac: list[str]):
+def update_map(metric: str, overlay: str, show_fac: list[str] | None):
     is_categorical = metric == "cluster"
+    show_fac = show_fac or []
+    hover = _get_hover(overlay)
 
     fig = go.Figure()
 
+    # -- Main choropleth ------------------------------------------------
     if is_categorical:
-        cluster_vals = tracts_gdf["cluster"].astype(str)
-        unique_clusters = sorted(cluster_vals.unique())
-        color_map = px.colors.qualitative.Set2
-        cluster_color = [color_map[int(c) % len(color_map)] for c in cluster_vals]
+        cluster_vals = tracts_gdf["cluster"].astype(int)
+        unique_k = sorted(cluster_vals.unique())
+        palette = px.colors.qualitative.Set2
+        n = len(unique_k)
+        cscale = [[i / max(1, n - 1), palette[i % len(palette)]] for i in range(n)]
 
-        fig.add_trace(go.Choroplethmapbox(
+        fig.add_trace(go.Choroplethmap(
             geojson=geojson_data,
             locations=tracts_gdf.index,
-            z=tracts_gdf["cluster"].astype(float),
-            colorscale=[[i / max(1, len(unique_clusters) - 1), color_map[i % len(color_map)]]
-                        for i in range(len(unique_clusters))],
-            marker_opacity=0.7,
+            z=cluster_vals.astype(float),
+            colorscale=cscale,
+            marker_opacity=0.75,
             marker_line_width=0.3,
-            marker_line_color="white",
-            text=hover_texts,
-            hoverinfo="text",
-            colorbar=dict(title="Cluster", tickvals=list(range(len(unique_clusters))),
-                          ticktext=unique_clusters),
-            name="Clusters",
+            marker_line_color="#ccc",
+            text=hover, hoverinfo="text",
+            colorbar=dict(
+                title=dict(text="Cluster"), len=0.5, y=0.5,
+                tickvals=list(range(n)), ticktext=[str(c) for c in unique_k],
+            ),
         ))
     else:
-        color_vals = tracts_gdf[metric].copy()
-        reverse = metric == "nearest_facility_min"
-        colorscale = "RdYlGn_r" if reverse else "RdYlGn"
+        vals = tracts_gdf[metric].copy()
+        cscale = METRIC_COLORSCALES.get(metric, "Greens")
 
-        fig.add_trace(go.Choroplethmapbox(
+        fig.add_trace(go.Choroplethmap(
             geojson=geojson_data,
             locations=tracts_gdf.index,
-            z=color_vals,
-            colorscale=colorscale,
-            marker_opacity=0.7,
+            z=vals,
+            colorscale=cscale,
+            marker_opacity=0.75,
             marker_line_width=0.3,
-            marker_line_color="white",
-            text=hover_texts,
-            hoverinfo="text",
-            colorbar=dict(title=FRIENDLY_NAMES.get(metric, metric)),
-            name=FRIENDLY_NAMES.get(metric, metric),
-            zmin=float(color_vals.quantile(0.02)) if color_vals.notna().any() else 0,
-            zmax=float(color_vals.quantile(0.98)) if color_vals.notna().any() else 1,
+            marker_line_color="#ccc",
+            text=hover, hoverinfo="text",
+            colorbar=dict(
+                title=dict(text=FRIENDLY.get(metric, metric)),
+                len=0.5, y=0.5,
+            ),
+            zmin=float(vals.quantile(0.02)) if vals.notna().any() else 0,
+            zmax=float(vals.quantile(0.98)) if vals.notna().any() else 1,
         ))
 
-    # Demographic overlay as a second semi-transparent layer
-    if overlay != "none" and overlay in tracts_gdf.columns and not is_categorical:
-        overlay_vals = tracts_gdf[overlay].copy()
-        fig.add_trace(go.Choroplethmapbox(
-            geojson=geojson_data,
-            locations=tracts_gdf.index,
-            z=overlay_vals,
-            colorscale="YlOrRd",
-            marker_opacity=0.35,
-            marker_line_width=0,
-            text=[f"{FRIENDLY_NAMES.get(overlay, overlay)}: {v:.2f}" if pd.notna(v) else "N/A"
-                  for v in overlay_vals],
-            hoverinfo="text",
-            colorbar=dict(title=FRIENDLY_NAMES.get(overlay, overlay), x=1.08),
-            name=FRIENDLY_NAMES.get(overlay, overlay),
-            zmin=float(overlay_vals.quantile(0.02)) if overlay_vals.notna().any() else 0,
-            zmax=float(overlay_vals.quantile(0.98)) if overlay_vals.notna().any() else 1,
-        ))
-
-    # Facility point markers
-    if show_fac and "show" in show_fac and not facilities_gdf.empty:
-        fac_lat = facilities_gdf.geometry.y.tolist()
-        fac_lon = facilities_gdf.geometry.x.tolist()
-        fac_text = (
+    # -- Facility markers -----------------------------------------------
+    if "show" in show_fac and not facilities_gdf.empty:
+        fac_names = (
             facilities_gdf["facility_name"].tolist()
             if "facility_name" in facilities_gdf.columns
             else [""] * len(facilities_gdf)
         )
-        fig.add_trace(go.Scattermapbox(
-            lat=fac_lat,
-            lon=fac_lon,
+        fig.add_trace(go.Scattermap(
+            lat=facilities_gdf.geometry.y.tolist(),
+            lon=facilities_gdf.geometry.x.tolist(),
             mode="markers",
-            marker=dict(size=4, color="#2b8cbe", opacity=0.6),
-            text=fac_text,
+            marker=dict(size=5, color="#e31a1c", opacity=0.7),
+            text=fac_names,
             name="Facilities",
             hoverinfo="text",
         ))
 
     fig.update_layout(
-        mapbox=dict(
+        map=dict(
             style="carto-positron",
             center=dict(lat=40.9, lon=-77.8),
             zoom=6.3,
         ),
-        margin={"r": 0, "t": 40, "l": 0, "b": 0},
-        title=f"PA Census Tracts — {FRIENDLY_NAMES.get(metric, metric)}",
-        legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01, bgcolor="rgba(255,255,255,0.8)"),
+        margin=dict(r=0, t=0, l=0, b=0),
+        showlegend=False,
+        dragmode="pan",
     )
 
-    # Summary statistics panel
-    col_data = tracts_gdf[metric] if metric in tracts_gdf.columns and not is_categorical else None
-    stat_parts = []
-    if col_data is not None:
-        stat_parts.extend([
-            html.Strong(FRIENDLY_NAMES.get(metric, metric)),
-            html.Br(),
-            html.Span(f"Mean: {col_data.mean():.4f}"),
-            html.Br(),
-            html.Span(f"Median: {col_data.median():.4f}"),
-            html.Br(),
-            html.Span(f"Min: {col_data.min():.4f}"),
-            html.Br(),
-            html.Span(f"Max: {col_data.max():.4f}"),
-            html.Br(),
-            html.Span(f"Std Dev: {col_data.std():.4f}"),
-            html.Br(),
-            html.Span(f"Zero-score tracts: {int((col_data == 0).sum())}"),
-            html.Br(), html.Br(),
+    # -- Sidebar stats --------------------------------------------------
+    stats = _build_stats(metric, overlay, is_categorical)
+    scatter = _build_scatter(metric, overlay, is_categorical)
+
+    return fig, stats, scatter
+
+
+def _build_stats(metric, overlay, is_categorical):
+    parts = []
+
+    if not is_categorical and metric in tracts_gdf.columns:
+        d = tracts_gdf[metric].dropna()
+        parts.extend([
+            html.Div(FRIENDLY.get(metric, metric),
+                     style={"fontWeight": "700", "marginBottom": "0.25rem"}),
+            _stat_line("Mean", f"{d.mean():.4f}"),
+            _stat_line("Median", f"{d.median():.4f}"),
+            _stat_line("Min", f"{d.min():.4f}"),
+            _stat_line("Max", f"{d.max():.4f}"),
+            _stat_line("Std Dev", f"{d.std():.4f}"),
         ])
+        if metric == "accessibility_score":
+            parts.append(_stat_line("Zero-score tracts", f"{int((d == 0).sum())}"))
+        parts.append(html.Br())
+
     elif is_categorical and "cluster" in tracts_gdf.columns:
         vc = tracts_gdf["cluster"].value_counts().sort_index()
-        stat_parts.append(html.Strong("Cluster Breakdown"))
-        stat_parts.append(html.Br())
-        for cluster_id, count in vc.items():
-            stat_parts.append(html.Span(f"Cluster {cluster_id}: {count} tracts"))
-            stat_parts.append(html.Br())
-        stat_parts.append(html.Br())
+        parts.append(html.Div("Cluster Breakdown",
+                              style={"fontWeight": "700", "marginBottom": "0.25rem"}))
+        for cid, cnt in vc.items():
+            parts.append(_stat_line(f"Cluster {cid}", f"{cnt} tracts"))
+        parts.append(html.Br())
 
     if overlay != "none" and overlay in tracts_gdf.columns:
-        ov_data = tracts_gdf[overlay]
-        stat_parts.extend([
-            html.Strong(f"Overlay: {FRIENDLY_NAMES.get(overlay, overlay)}"),
+        od = tracts_gdf[overlay].dropna()
+        parts.extend([
+            html.Div(f"Overlay: {FRIENDLY.get(overlay, overlay)}",
+                     style={"fontWeight": "700", "marginBottom": "0.25rem"}),
+            _stat_line("Mean", f"{od.mean():.2f}"),
+            _stat_line("Median", f"{od.median():.2f}"),
+            _stat_line("Min", f"{od.min():.2f}"),
+            _stat_line("Max", f"{od.max():.2f}"),
             html.Br(),
-            html.Span(f"Mean: {ov_data.mean():.2f}"),
-            html.Br(),
-            html.Span(f"Median: {ov_data.median():.2f}"),
-            html.Br(), html.Br(),
         ])
 
-    stat_parts.extend([
-        html.Span(f"Total tracts: {len(tracts_gdf):,}"),
-        html.Br(),
-        html.Span(f"Geocoded facilities: {len(facilities_gdf):,}"),
+    parts.extend([
+        _stat_line("Total tracts", f"{len(tracts_gdf):,}"),
+        _stat_line("Geocoded facilities", f"{len(facilities_gdf):,}"),
+    ])
+    return html.Div(parts)
+
+
+def _stat_line(label, value):
+    return html.Div([
+        html.Span(f"{label}: ", style={"color": "#555"}),
+        html.Span(value, style={"fontWeight": "600"}),
     ])
 
-    return fig, html.Div(stat_parts)
+
+def _build_scatter(metric, overlay, is_categorical):
+    if overlay == "none" or is_categorical:
+        return html.Div()
+    if metric not in tracts_gdf.columns or overlay not in tracts_gdf.columns:
+        return html.Div()
+
+    df = tracts_gdf[[metric, overlay]].dropna()
+    if len(df) < 10:
+        return html.Div()
+
+    corr = df[metric].corr(df[overlay])
+    fig = px.scatter(
+        df, x=overlay, y=metric, opacity=0.3,
+        labels={overlay: FRIENDLY.get(overlay, overlay),
+                metric: FRIENDLY.get(metric, metric)},
+        trendline="ols",
+    )
+    fig.update_traces(marker=dict(size=3, color="#4575b4"))
+    fig.update_layout(
+        height=220,
+        margin=dict(l=40, r=10, t=30, b=40),
+        title=dict(text=f"r = {corr:.3f}", x=0.5, font=dict(size=12)),
+        template="plotly_white",
+        font=dict(size=10),
+    )
+    return html.Div([
+        html.Div("Metric vs Overlay",
+                 style={"fontWeight": "700", "fontSize": "0.82rem", "marginBottom": "0.25rem"}),
+        dcc.Graph(figure=fig, config={"displayModeBar": False},
+                  style={"height": "220px"}),
+    ])
 
 
 if __name__ == "__main__":
