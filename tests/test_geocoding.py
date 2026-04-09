@@ -125,3 +125,22 @@ class TestCrossReferenceSources:
         result = cross_reference_sources(cms, hrsa)
         assert len(result) == 1
         assert result["source_provenance"].iloc[0] == "hrsa"
+
+    def test_deduplicates_exact_same_address_after_merge(self):
+        cms = gpd.GeoDataFrame(
+            {
+                "facility_name": ["Hospital A", "Hospital A Duplicate"],
+                "address": ["123 Main St", "123 Main St"],
+                "city": ["York", "York"],
+                "state": ["PA", "PA"],
+                "zip": ["17401", "17401"],
+                "provider_count": [1.0, 1.0],
+                "source": ["cms", "cms"],
+            },
+            geometry=[Point(-76.73, 39.96), Point(-76.73, 39.96)],
+            crs="EPSG:4326",
+        )
+        hrsa = gpd.GeoDataFrame(columns=["geometry"], geometry="geometry", crs="EPSG:4326")
+        result = cross_reference_sources(cms, hrsa)
+        assert len(result) == 1
+        assert result["provider_count"].iloc[0] == 2.0

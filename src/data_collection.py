@@ -151,13 +151,16 @@ def _fetch_npi_facilities(
                 npi = str(r.get("number", ""))
                 if npi in seen_npi:
                     continue
-                seen_npi.add(npi)
                 basic = r.get("basic", {})
                 addresses = r.get("addresses", [])
                 practice_addr = next(
                     (a for a in addresses if a.get("address_purpose") == "LOCATION"),
                     addresses[0] if addresses else {},
                 )
+                practice_state = str(practice_addr.get("state", "") or "").strip().upper()
+                if practice_state != state.upper():
+                    continue
+                seen_npi.add(npi)
                 all_records.append(
                     {
                         "npi": npi,

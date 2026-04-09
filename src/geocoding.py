@@ -6,6 +6,7 @@ validate coordinate accuracy, and cross-reference across data sources.
 
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 import geopandas as gpd
@@ -41,6 +42,92 @@ def _census_geocode_oneline(address: str, timeout: int = 15) -> tuple[Optional[f
             return None, None
         coords = matches[0]["coordinates"]
         return float(coords["y"]), float(coords["x"])
+    except Exception:
+        return None, None
+
+
+def _clean_query_text(text: str) -> str:
+    cleaned = " ".join(str(text or "").strip().split())
+    return cleaned.replace(" AND ", " & ")
+
+
+def _normalize_city(city: str) -> str:
+    normalized = _clean_query_text(city).upper()
+    aliases = {
+        "PHILA": "PHILADELPHIA",
+        "PITTSBURG": "PITTSBURGH",
+        "MT GRETNA": "MOUNT GRETNA",
+        "ST MARYS": "SAINT MARYS",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _build_query_candidates(
+    row: pd.Series,
+    address_col: str,
+    city_col: str,
+    state_col: str,
+    zip_col: str,
+) -> list[str]:
+    facility_name = _clean_query_text(row.get("facility_name", ""))
+    address = _clean_query_text(row.get(address_col, ""))
+    city = _normalize_city(str(row.get(city_col, "")))
+    state = _clean_query_text(row.get(state_col, ""))
+    zip_code = _clean_query_text(str(row.get(zip_col, "") or "")[:5])
+    address_variants = [address]
+    if "&" in address:
+        address_variants.append(address.replace("&", "AND"))
+    if " ROAD" in address:
+        address_variants.append(address.replace(" ROAD", " RD"))
+    if " RD" in address:
+        address_variants.append(address.replace(" RD", " ROAD"))
+    if " BOULEVARD" in address:
+        address_variants.append(address.replace(" BOULEVARD", " BLVD"))
+    if " BLVD" in address:
+        address_variants.append(address.replace(" BLVD", " BOULEVARD"))
+
+    candidates: list[str] = []
+    for address_variant in address_variants:
+        for parts in [
+            [facility_name, address_variant, city, state, zip_code],
+            [address_variant, city, state, zip_code],
+            [facility_name, city, state, zip_code],
+            [facility_name, address_variant, city, state],
+            [facility_name, city, state],
+            [address_variant, city, state],
+        ]:
+            query = ", ".join(part for part in parts if part)
+            if query and query not in candidates:
+                candidates.append(query)
+    return candidates
+
+
+def _nominatim_geocode(query: str, timeout: int = 30) -> tuple[Optional[float], Optional[float]]:
+    if not query:
+        return None, None
+    try:
+        response = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={
+                "q": query,
+                "format": "jsonv2",
+                "limit": 1,
+                "countrycodes": "us",
+                "addressdetails": 1,
+            },
+            headers={"User-Agent": "DS440-Capstone-Project/1.0"},
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not payload:
+            return None, None
+        match = payload[0]
+        address = match.get("address", {})
+        state_name = str(address.get("state", "") or "")
+        if state_name and "pennsylvania" not in state_name.lower():
+            return None, None
+        return float(match["lat"]), float(match["lon"])
     except Exception:
         return None, None
 
@@ -151,6 +238,9 @@ def geocode_facilities(
     if lon_col is None:
         df["longitude"] = None
         lon_col = "longitude"
+    for required_col in [address_col, city_col, state_col, zip_col]:
+        if required_col not in df.columns:
+            df[required_col] = ""
 
     df["latitude"] = pd.to_numeric(df[lat_col], errors="coerce")
     df["longitude"] = pd.to_numeric(df[lon_col], errors="coerce")
@@ -165,29 +255,99 @@ def geocode_facilities(
         still_missing = df["latitude"].isna() | df["longitude"].isna()
         n_still = still_missing.sum()
         print(f"  Batch geocoded {n_missing - n_still} / {n_missing} facilities")
-        if n_still > 0 and n_still <= 50:
-            print(f"  Single-address fallback for {n_still} remaining...")
-            address_pieces = []
-            for _, row in df.iterrows():
-                address_pieces.append(
-                    ", ".join(
-                        str(row.get(col, "")).strip()
-                        for col in [address_col, city_col, state_col, zip_col]
-                        if str(row.get(col, "")).strip()
-                    )
-                )
+        if n_still > 0:
+            print(f"  Census single-address fallback for {n_still} remaining...")
+            census_cache: dict[str, tuple[Optional[float], Optional[float]]] = {}
+            before_census = n_still
             for idx in df.index[still_missing]:
-                lat, lon = _census_geocode_oneline(address_pieces[idx])
+                query = ", ".join(
+                    str(df.at[idx, col]).strip()
+                    for col in [address_col, city_col, state_col, zip_col]
+                    if str(df.at[idx, col]).strip()
+                )
+                if query not in census_cache:
+                    census_cache[query] = _census_geocode_oneline(query)
+                lat, lon = census_cache[query]
                 if lat is not None and lon is not None:
                     df.at[idx, "latitude"] = lat
                     df.at[idx, "longitude"] = lon
                     df.at[idx, "geocode_status"] = "geocoded"
+
+            still_missing = df["latitude"].isna() | df["longitude"].isna()
+            n_still = still_missing.sum()
+            print(f"  Census fallback geocoded {before_census - n_still} additional facilities")
+
+        if n_still > 0:
+            print(f"  Nominatim fallback for {n_still} remaining...")
+            nominatim_cache: dict[str, tuple[Optional[float], Optional[float]]] = {}
+            for idx in df.index[still_missing]:
+                row = df.loc[idx]
+                for query in _build_query_candidates(row, address_col, city_col, state_col, zip_col):
+                    if query not in nominatim_cache:
+                        nominatim_cache[query] = _nominatim_geocode(query)
+                        time.sleep(1.0)
+                    lat, lon = nominatim_cache[query]
+                    if lat is not None and lon is not None:
+                        df.at[idx, "latitude"] = lat
+                        df.at[idx, "longitude"] = lon
+                        df.at[idx, "geocode_status"] = "nominatim_geocoded"
+                        break
+
+            still_missing = df["latitude"].isna() | df["longitude"].isna()
+            print(f"  Total geocoded after all fallbacks: {(~still_missing).sum()} / {len(df)}")
 
     geometry = [
         Point(lon, lat) if pd.notna(lat) and pd.notna(lon) else None
         for lat, lon in zip(df["latitude"], df["longitude"])
     ]
     return gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
+
+
+def _address_group_key(df: pd.DataFrame) -> pd.Series:
+    address = df["address"].fillna("").astype(str).str.upper().str.strip() if "address" in df.columns else ""
+    city = df["city"].fillna("").astype(str).str.upper().str.strip() if "city" in df.columns else ""
+    state = df["state"].fillna("").astype(str).str.upper().str.strip() if "state" in df.columns else ""
+    zip_code = (
+        df["zip"].fillna("").astype(str).str.upper().str.strip().str[:5]
+        if "zip" in df.columns
+        else ""
+    )
+    if isinstance(address, str):
+        return pd.Series(df.index.astype(str), index=df.index)
+    key = address + "|" + city + "|" + state + "|" + zip_code
+    blank_mask = key.str.replace("|", "", regex=False).eq("")
+    if "facility_id" in df.columns:
+        key.loc[blank_mask] = "facility_id|" + df.loc[blank_mask, "facility_id"].astype(str)
+    else:
+        key.loc[blank_mask] = "row|" + df.index[blank_mask].astype(str)
+    return key
+
+
+def _deduplicate_facilities(facilities: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    if facilities.empty:
+        return facilities
+
+    work = facilities.copy()
+    if "provider_count" in work.columns:
+        work["provider_count"] = pd.to_numeric(work["provider_count"], errors="coerce").fillna(1.0)
+
+    work["_group_key"] = _address_group_key(work)
+    rows: list[pd.Series] = []
+    for _, group in work.groupby("_group_key", sort=False):
+        row = group.iloc[0].copy()
+        if "provider_count" in group.columns:
+            row["provider_count"] = float(group["provider_count"].sum())
+        for col in ["source", "source_provenance"]:
+            if col in group.columns:
+                values = sorted({str(v).strip() for v in group[col].dropna() if str(v).strip()})
+                row[col] = "+".join(values)
+        if "geometry" in group.columns:
+            valid_geom = group.loc[group.geometry.notna() & ~group.geometry.is_empty, "geometry"]
+            row["geometry"] = valid_geom.iloc[0] if not valid_geom.empty else None
+        rows.append(row)
+
+    out = pd.DataFrame(rows).drop(columns=["_group_key"], errors="ignore")
+    return gpd.GeoDataFrame(out, geometry="geometry", crs=facilities.crs)
 
 
 def validate_coordinates(
@@ -217,7 +377,7 @@ def validate_coordinates(
 
     facilities = gdf.to_crs(3857)
     boundary = state_boundary.to_crs(3857)
-    boundary_union = boundary.unary_union
+    boundary_union = boundary.union_all()
     boundary_buffer = boundary_union.buffer(tolerance_m)
 
     ids = facilities["facility_id"] if "facility_id" in facilities.columns else facilities.index
@@ -273,11 +433,11 @@ def cross_reference_sources(
     if cms.empty:
         out = hrsa.copy()
         out["source_provenance"] = "hrsa"
-        return out
+        return _deduplicate_facilities(out)
     if hrsa.empty:
         out = cms.copy()
         out["source_provenance"] = "cms"
-        return out
+        return _deduplicate_facilities(out)
 
     cms = cms.to_crs(4326)
     hrsa = hrsa.to_crs(4326)
@@ -315,4 +475,5 @@ def cross_reference_sources(
     for drop_col in ["cms_idx", "hrsa_idx"]:
         if drop_col in out.columns:
             out = out.drop(columns=[drop_col])
-    return gpd.GeoDataFrame(out, geometry="geometry", crs="EPSG:4326")
+    out_gdf = gpd.GeoDataFrame(out, geometry="geometry", crs="EPSG:4326")
+    return _deduplicate_facilities(out_gdf)

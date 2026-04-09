@@ -175,7 +175,11 @@ def _build_hover(gdf, overlay_col=None):
             v = r["nearest_facility_min"]
             p.append(f"Nearest Facility: {v:.1f} min" if pd.notna(v) else "Nearest Facility: N/A")
         if "facilities_in_catchment" in gdf.columns and pd.notna(r.get("facilities_in_catchment")):
-            p.append(f"Facilities in Catchment: {int(r['facilities_in_catchment'])}")
+            p.append(
+                "Facilities in Catchment: "
+                f"{int(r['facilities_in_catchment'])} "
+                "(within drive-time radius; may be outside tract)"
+            )
         if "total_population" in gdf.columns and pd.notna(r.get("total_population")):
             p.append(f"Population: {int(r['total_population']):,}")
         if overlay_col and overlay_col in gdf.columns:

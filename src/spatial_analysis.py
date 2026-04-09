@@ -33,6 +33,42 @@ CIRCUITY_FACTORS: dict[str, float] = {
 AVG_ROAD_SPEED_MPH: float = 35.0
 
 
+def _nearest_drive_time_series(
+    origins: gpd.GeoDataFrame,
+    destinations: gpd.GeoDataFrame,
+    urbanicity: pd.Series | None = None,
+) -> pd.Series:
+    """Compute nearest-facility drive time for every origin without a cutoff."""
+    if origins.empty or destinations.empty:
+        return pd.Series(dtype=float)
+
+    origin_id_col = "geoid" if "geoid" in origins.columns else None
+    o = origins.copy()
+    d = destinations.copy()
+    if not all(o.geometry.geom_type == "Point"):
+        o["geometry"] = o.geometry.centroid
+    if not all(d.geometry.geom_type == "Point"):
+        d["geometry"] = d.geometry.centroid
+
+    o = o.to_crs(epsg=32617)
+    d = d.to_crs(epsg=32617)
+    origin_ids = o[origin_id_col].astype(str).values if origin_id_col else o.index.astype(str).values
+
+    if urbanicity is not None:
+        urban_arr = urbanicity.astype(str).values
+    else:
+        urban_arr = np.full(len(o), "suburban")
+    circ_arr = np.array([CIRCUITY_FACTORS.get(str(u), 1.30) for u in urban_arr])
+
+    origin_xy = np.column_stack([o.geometry.x.values, o.geometry.y.values])
+    dest_xy = np.column_stack([d.geometry.x.values, d.geometry.y.values])
+    dest_tree = cKDTree(dest_xy)
+    dists_m, _ = dest_tree.query(origin_xy, k=1)
+    road_miles = (dists_m * circ_arr) / 1609.344
+    travel_min = (road_miles / AVG_ROAD_SPEED_MPH) * 60.0
+    return pd.Series(travel_min, index=origin_ids, dtype=float)
+
+
 def build_road_network(
     roads_gdf: gpd.GeoDataFrame | None = None,
     speed_map: dict[str, float] | None = None,
@@ -263,7 +299,12 @@ def e2sfca(
     pairs = drive_times.copy()
     if pairs.empty:
         tracts_out["accessibility_score"] = 0.0
-        tracts_out["nearest_facility_min"] = np.nan
+        nearest_all = _nearest_drive_time_series(
+            tracts_out,
+            facilities_work,
+            tracts_out["urbanicity"],
+        )
+        tracts_out["nearest_facility_min"] = tracts_out["_tract_id"].map(nearest_all)
         tracts_out["facilities_in_catchment"] = 0
         tracts_out["provider_pop_ratio"] = 0.0
         return tracts_out.drop(columns=["_tract_id"])
@@ -278,9 +319,14 @@ def e2sfca(
 
     pairs["threshold"] = pairs["urbanicity"].map(thresholds).fillna(thresholds.get("suburban", 20.0))
     pairs = pairs[pairs["drive_time_min"] <= pairs["threshold"]].copy()
+    nearest_all = _nearest_drive_time_series(
+        tracts_out,
+        facilities_work,
+        tracts_out["urbanicity"],
+    )
     if pairs.empty:
         tracts_out["accessibility_score"] = 0.0
-        tracts_out["nearest_facility_min"] = np.nan
+        tracts_out["nearest_facility_min"] = tracts_out["_tract_id"].map(nearest_all)
         tracts_out["facilities_in_catchment"] = 0
         tracts_out["provider_pop_ratio"] = 0.0
         return tracts_out.drop(columns=["_tract_id"])
@@ -296,14 +342,13 @@ def e2sfca(
     pairs["ratio_weighted"] = pairs["facility_ratio"] * pairs["weight"]
 
     scores = pairs.groupby("origin_id", as_index=True)["ratio_weighted"].sum()
-    nearest = drive_times.groupby("origin_id", as_index=True)["drive_time_min"].min()
     facility_counts = pairs.groupby("origin_id", as_index=True)["destination_id"].nunique()
     providers_in_range = pairs.groupby("origin_id", as_index=True)[provider_col].sum()
     populations = tracts_out.set_index("_tract_id")[population_col].replace(0.0, np.nan)
     provider_pop_ratio = ((providers_in_range / populations) * 1000.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     tracts_out["accessibility_score"] = tracts_out["_tract_id"].map(scores).fillna(0.0)
-    tracts_out["nearest_facility_min"] = tracts_out["_tract_id"].map(nearest)
+    tracts_out["nearest_facility_min"] = tracts_out["_tract_id"].map(nearest_all)
     tracts_out["facilities_in_catchment"] = tracts_out["_tract_id"].map(facility_counts).fillna(0).astype(int)
     tracts_out["provider_pop_ratio"] = tracts_out["_tract_id"].map(provider_pop_ratio).fillna(0.0)
     return tracts_out.drop(columns=["_tract_id"])
