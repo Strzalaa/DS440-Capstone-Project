@@ -15,6 +15,13 @@ import pandas as pd
 import plotly.graph_objects as go
 
 
+def _projected_center(gdf: gpd.GeoDataFrame) -> tuple[float, float]:
+    work = gdf.to_crs(3857)
+    center = work.geometry.union_all().centroid
+    center_ll = gpd.GeoSeries([center], crs=3857).to_crs(4326).iloc[0]
+    return float(center_ll.y), float(center_ll.x)
+
+
 def choropleth_map(
     tracts: gpd.GeoDataFrame,
     value_col: str = "accessibility_score",
@@ -51,8 +58,8 @@ def choropleth_map(
     work = tracts.to_crs(4326).copy()
     work = work.reset_index(drop=True)
     work["_row_id"] = work.index.astype(str)
-    center = work.geometry.union_all().centroid
-    fmap = folium.Map(location=[center.y, center.x], zoom_start=7, tiles="cartodbpositron")
+    lat, lon = _projected_center(work)
+    fmap = folium.Map(location=[lat, lon], zoom_start=7, tiles="cartodbpositron")
 
     folium.Choropleth(
         geo_data=work.__geo_interface__,
@@ -145,8 +152,8 @@ def facility_map(
         return base_map or folium.Map(location=[40.9, -77.8], zoom_start=7, tiles="cartodbpositron")
 
     if base_map is None:
-        center = fac.geometry.union_all().centroid
-        base_map = folium.Map(location=[center.y, center.x], zoom_start=7, tiles="cartodbpositron")
+        lat, lon = _projected_center(fac)
+        base_map = folium.Map(location=[lat, lon], zoom_start=7, tiles="cartodbpositron")
 
     popup_cols = popup_cols or [c for c in ["facility_name", "source", "provider_count"] if c in fac.columns]
     for _, row in fac.iterrows():

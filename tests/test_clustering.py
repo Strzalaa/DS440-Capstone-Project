@@ -55,6 +55,22 @@ class TestPrepareFeatures:
         X, _ = prepare_features(gdf)
         assert not np.isnan(X).any()
 
+    def test_svi_sentinel_treated_as_missing(self):
+        gdf = _make_test_gdf(60)
+        gdf.loc[:10, "svi_overall"] = -999.0
+        X, cols = prepare_features(gdf)
+        svi_i = cols.index("svi_overall")
+        assert np.isfinite(X[:, svi_i]).all()
+        assert np.abs(X[:, svi_i]).max() < 5.0
+
+    def test_extreme_outlier_is_winsorized_before_scaling(self):
+        gdf = _make_test_gdf(100)
+        gdf["provider_pop_ratio"] = 1.0
+        gdf.loc[99, "provider_pop_ratio"] = 10_000.0
+        X, cols = prepare_features(gdf, scale=False)
+        ratio_i = cols.index("provider_pop_ratio")
+        assert X[:, ratio_i].max() < 10_000.0
+
     def test_raises_on_no_columns(self):
         gdf = gpd.GeoDataFrame({"x": [1, 2]}, geometry=[Point(0, 0), Point(1, 1)], crs="EPSG:4326")
         with pytest.raises(ValueError):
@@ -66,7 +82,10 @@ class TestKmeansOptimalK:
         gdf = _make_test_gdf(100)
         X, _ = prepare_features(gdf)
         result = kmeans_optimal_k(X)
-        assert 2 <= result["optimal_k"] <= 10
+        # Default min_k=3: typology uses at least 3 groups when n is large
+        assert 3 <= result["optimal_k"] <= 10
+        assert len(result["max_largest_cluster_fracs"]) == len(result["valid_ks"])
+        assert "balance_preference_met" in result
 
     def test_silhouette_scores_in_range(self):
         gdf = _make_test_gdf(100)
@@ -87,6 +106,13 @@ class TestKmeansOptimalK:
         result = kmeans_optimal_k(X)
         inertias = result["inertias"]
         assert all(inertias[i] >= inertias[i + 1] for i in range(len(inertias) - 1))
+
+    def test_fixed_k_respected(self):
+        gdf = _make_test_gdf(80)
+        X, _ = prepare_features(gdf)
+        result = kmeans_optimal_k(X, fixed_k=4)
+        assert result["optimal_k"] == 4
+        assert len(np.unique(result["labels"])) == 4
 
 
 class TestHierarchicalClustering:

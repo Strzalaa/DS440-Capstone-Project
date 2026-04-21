@@ -33,6 +33,15 @@ CIRCUITY_FACTORS: dict[str, float] = {
 AVG_ROAD_SPEED_MPH: float = 35.0
 
 
+def _project_points(gdf: gpd.GeoDataFrame, epsg: int) -> gpd.GeoDataFrame:
+    """Project geometries safely, converting polygons to centroids in projected CRS."""
+    work = gdf.copy()
+    work = work.to_crs(epsg=epsg)
+    if not all(work.geometry.geom_type == "Point"):
+        work["geometry"] = work.geometry.centroid
+    return work
+
+
 def _nearest_drive_time_series(
     origins: gpd.GeoDataFrame,
     destinations: gpd.GeoDataFrame,
@@ -43,15 +52,8 @@ def _nearest_drive_time_series(
         return pd.Series(dtype=float)
 
     origin_id_col = "geoid" if "geoid" in origins.columns else None
-    o = origins.copy()
-    d = destinations.copy()
-    if not all(o.geometry.geom_type == "Point"):
-        o["geometry"] = o.geometry.centroid
-    if not all(d.geometry.geom_type == "Point"):
-        d["geometry"] = d.geometry.centroid
-
-    o = o.to_crs(epsg=32617)
-    d = d.to_crs(epsg=32617)
+    o = _project_points(origins, epsg=32617)
+    d = _project_points(destinations, epsg=32617)
     origin_ids = o[origin_id_col].astype(str).values if origin_id_col else o.index.astype(str).values
 
     if urbanicity is not None:
@@ -120,15 +122,8 @@ def compute_drive_times(
     origin_id_col = "geoid" if "geoid" in origins.columns else None
     dest_id_col = "facility_id" if "facility_id" in destinations.columns else None
 
-    o = origins.copy()
-    d = destinations.copy()
-    if not all(o.geometry.geom_type == "Point"):
-        o["geometry"] = o.geometry.centroid
-    if not all(d.geometry.geom_type == "Point"):
-        d["geometry"] = d.geometry.centroid
-
-    o = o.to_crs(epsg=32617)
-    d = d.to_crs(epsg=32617)
+    o = _project_points(origins, epsg=32617)
+    d = _project_points(destinations, epsg=32617)
 
     origin_ids = o[origin_id_col].astype(str).values if origin_id_col else o.index.astype(str).values
     dest_ids = d[dest_id_col].astype(str).values if dest_id_col else d.index.astype(str).values

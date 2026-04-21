@@ -125,9 +125,9 @@ def run_gwr(
         raise ValueError("No independent variables available for GWR.")
 
     work = data.copy()
+    work = work.to_crs(3857)
     if not all(work.geometry.geom_type == "Point"):
         work["geometry"] = work.geometry.centroid
-    work = work.to_crs(3857)
     cols = [dependent_var, *predictors, "geometry"]
     work = work[cols].replace([np.inf, -np.inf], np.nan).dropna()
     if work.empty:

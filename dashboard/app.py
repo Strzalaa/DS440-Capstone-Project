@@ -7,6 +7,7 @@ Run with:
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import geopandas as gpd
@@ -15,6 +16,12 @@ import pandas as pd
 from dash import Dash, Input, Output, dcc, html
 import plotly.express as px
 import plotly.graph_objects as go
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+from src.svi import mask_svi_percentile
+from src.clustering import characterize_clusters
 
 DATA_OUTPUTS = Path(__file__).resolve().parent.parent / "data" / "outputs"
 DATA_PROCESSED = Path(__file__).resolve().parent.parent / "data" / "processed"
@@ -41,9 +48,14 @@ def _load_data():
         if col in gdf.columns:
             gdf[col] = pd.to_numeric(gdf[col], errors="coerce")
 
-    for col in ["median_household_income"]:
+    if "median_household_income" in gdf.columns:
+        gdf.loc[gdf["median_household_income"] < 0, "median_household_income"] = np.nan
+    for col in ["pct_uninsured", "pct_no_vehicle"]:
         if col in gdf.columns:
-            gdf.loc[gdf[col] < 0, col] = np.nan
+            gdf.loc[~gdf[col].between(0.0, 100.0, inclusive="both"), col] = np.nan
+
+    if "svi_overall" in gdf.columns:
+        gdf["svi_overall"] = mask_svi_percentile(gdf["svi_overall"])
 
     gdf["geometry"] = gdf.geometry.simplify(tolerance=0.005, preserve_topology=True)
 
@@ -54,6 +66,66 @@ def _load_data():
 
 tracts_gdf, facilities_gdf = _load_data()
 geojson_data = json.loads(tracts_gdf.to_json())
+
+# Typology table for sidebar when the cluster map is not shown (dominant cluster)
+CLUSTER_CHOROPLETH_MAX_LARGEST_FRAC = 0.90
+try:
+    CLUSTER_PROFILES: pd.DataFrame | None = (
+        characterize_clusters(tracts_gdf, label_col="cluster")
+        if "cluster" in tracts_gdf.columns
+        else None
+    )
+except ValueError:
+    CLUSTER_PROFILES = None
+
+
+def _cluster_choropleth_worthwhile() -> bool:
+    """False when a cluster choropleth would look like a single class (e.g. ≥90% in one)."""
+    if "cluster" not in tracts_gdf.columns:
+        return False
+    s = tracts_gdf["cluster"].dropna()
+    if len(s) < 2:
+        return False
+    vc = s.value_counts()
+    if len(vc) < 2:
+        return False
+    largest = float(vc.max() / len(s))
+    return largest < CLUSTER_CHOROPLETH_MAX_LARGEST_FRAC
+
+
+def _cluster_profile_table_block():
+    if CLUSTER_PROFILES is None or CLUSTER_PROFILES.empty:
+        return html.Div("Cluster profile table is not available for this file.", style={"fontSize": "0.8rem"})
+    df = CLUSTER_PROFILES
+    ths = [html.Th(" ".join(c.replace("_", " ").split()[:4])) for c in df.columns]
+    rows = []
+    for _, r in df.iterrows():
+        tds = []
+        for c in df.columns:
+            v = r[c]
+            if pd.isna(v):
+                tds.append(html.Td("—"))
+            elif c == "cluster":
+                tds.append(html.Td(str(int(v))))
+            elif c in ("n_tracts", "total_population"):
+                tds.append(html.Td(f"{int(v):,}"))
+            else:
+                tds.append(html.Td(f"{float(v):.4g}"))
+        rows.append(html.Tr(tds))
+    return html.Div([
+        html.Div(
+            "Cluster typology profiles (means; map hidden when one group dominates the state)",
+            style={"fontWeight": "700", "fontSize": "0.82rem", "marginBottom": "0.35rem", "lineHeight": "1.3"},
+        ),
+        html.Div(
+            html.Table(
+                [html.Thead(html.Tr(ths)), html.Tbody(rows)],
+                style={"borderCollapse": "collapse", "fontSize": "0.68rem", "width": "100%"},
+            ),
+            style={"overflowX": "auto", "maxWidth": "100%"},
+        ),
+    ])
+
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -214,13 +286,16 @@ def _get_hover(overlay_col):
 )
 def update_map(metric: str, overlay: str, show_fac: list[str] | None):
     is_categorical = metric == "cluster"
+    show_map_clusters = is_categorical and _cluster_choropleth_worthwhile()
     show_fac = show_fac or []
     hover = _get_hover(overlay)
 
     fig = go.Figure()
 
     # -- Main choropleth ------------------------------------------------
-    if is_categorical:
+    loc_ids = tracts_gdf["geoid"].astype(str) if "geoid" in tracts_gdf.columns else tracts_gdf.index.astype(str)
+
+    if is_categorical and show_map_clusters:
         cluster_vals = tracts_gdf["cluster"].astype(int)
         unique_k = sorted(cluster_vals.unique())
         palette = px.colors.qualitative.Set2
@@ -229,7 +304,8 @@ def update_map(metric: str, overlay: str, show_fac: list[str] | None):
 
         fig.add_trace(go.Choroplethmap(
             geojson=geojson_data,
-            locations=tracts_gdf.index,
+            featureidkey="properties.geoid" if "geoid" in tracts_gdf.columns else "id",
+            locations=loc_ids,
             z=cluster_vals.astype(float),
             colorscale=cscale,
             marker_opacity=0.75,
@@ -241,13 +317,30 @@ def update_map(metric: str, overlay: str, show_fac: list[str] | None):
                 tickvals=list(range(n)), ticktext=[str(c) for c in unique_k],
             ),
         ))
-    else:
+    elif is_categorical and not show_map_clusters:
+        fig.add_annotation(
+            text=(
+                "Cluster map hidden: the largest group holds a large share of tracts, "
+                "so a choropleth would look like a single color. See the <b>typology table</b> "
+                "below, or re-run the clustering step after refreshing tract features."
+            ),
+            xref="paper",
+            yref="paper",
+            x=0.5,
+            y=0.55,
+            xanchor="center",
+            yanchor="middle",
+            showarrow=False,
+            font=dict(size=12, family="Segoe UI, Arial, sans-serif"),
+        )
+    elif not is_categorical:
         vals = tracts_gdf[metric].copy()
         cscale = METRIC_COLORSCALES.get(metric, "Greens")
 
         fig.add_trace(go.Choroplethmap(
             geojson=geojson_data,
-            locations=tracts_gdf.index,
+            featureidkey="properties.geoid" if "geoid" in tracts_gdf.columns else "id",
+            locations=loc_ids,
             z=vals,
             colorscale=cscale,
             marker_opacity=0.75,
@@ -290,14 +383,17 @@ def update_map(metric: str, overlay: str, show_fac: list[str] | None):
         dragmode="pan",
     )
 
-    # -- Sidebar stats --------------------------------------------------
-    stats = _build_stats(metric, overlay, is_categorical)
-    scatter = _build_scatter(metric, overlay, is_categorical)
+    # -- Sidebar stats & cluster profile / scatter -----------------------
+    stats = _build_stats(metric, overlay, is_categorical, show_map_clusters)
+    if is_categorical and not show_map_clusters:
+        scatter = _cluster_profile_table_block()
+    else:
+        scatter = _build_scatter(metric, overlay, is_categorical)
 
     return fig, stats, scatter
 
 
-def _build_stats(metric, overlay, is_categorical):
+def _build_stats(metric, overlay, is_categorical, show_cluster_map: bool = True):
     parts = []
 
     if not is_categorical and metric in tracts_gdf.columns:
@@ -321,6 +417,11 @@ def _build_stats(metric, overlay, is_categorical):
                               style={"fontWeight": "700", "marginBottom": "0.25rem"}))
         for cid, cnt in vc.items():
             parts.append(_stat_line(f"Cluster {cid}", f"{cnt} tracts"))
+        if not show_cluster_map:
+            parts.append(html.P(
+                "Statewide map is off while one cluster is dominant. Use the profile table in the next panel or re-run k-means with the updated selection rule.",
+                style={"color": "#666", "fontSize": "0.78rem", "margin": "0.4rem 0 0 0", "lineHeight": "1.35"},
+            ))
         parts.append(html.Br())
 
     if overlay != "none" and overlay in tracts_gdf.columns:
