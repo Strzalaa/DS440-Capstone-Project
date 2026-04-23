@@ -144,3 +144,123 @@ class TestCrossReferenceSources:
         result = cross_reference_sources(cms, hrsa)
         assert len(result) == 1
         assert result["provider_count"].iloc[0] == 2.0
+
+
+class TestNwayMerge:
+    """Tests for the N-way priority merge + fuzzy name matching added on top
+    of the legacy CMS+HRSA signature."""
+
+    def _mk(self, source, name, lon, lat, address="1 Main St", city="Anywhere", zip_="17101"):
+        return gpd.GeoDataFrame(
+            {
+                "facility_name": [name],
+                "address": [address],
+                "city": [city],
+                "state": ["PA"],
+                "zip": [zip_],
+                "provider_count": [1.0],
+                "source": [source],
+            },
+            geometry=[Point(lon, lat)],
+            crs="EPSG:4326",
+        )
+
+    def test_three_sources_spatial_match_collapses_to_one(self):
+        hifld = self._mk("hifld_hospitals", "Mount Nittany Medical Center", -77.85, 40.79)
+        hrsa = self._mk("hrsa_hc", "Mount Nittany Medical Center", -77.850005, 40.790003)
+        npi = self._mk("npi", "Mount Nittany Medical Center", -77.850002, 40.790001)
+        result = cross_reference_sources(
+            hifld,
+            hrsa,
+            npi,
+            priority=["hifld_hospitals", "hrsa_hc", "npi"],
+        )
+        assert len(result) == 1
+        prov = result["source_provenance"].iloc[0]
+        parts = set(prov.split("+"))
+        assert {"hifld_hospitals", "hrsa_hc", "npi"}.issubset(parts)
+
+    def test_priority_winner_keeps_highest_priority_source(self):
+        """When three sources match, the record from the highest-priority
+        source supplies the geometry/name."""
+        hifld = self._mk("hifld_hospitals", "HIFLD Name", -77.85, 40.79)
+        hrsa = self._mk("hrsa_hc", "HRSA Name", -77.850005, 40.790003)
+        npi = self._mk("npi", "NPI Name", -77.850002, 40.790001)
+        result = cross_reference_sources(
+            hifld,
+            hrsa,
+            npi,
+            priority=["hifld_hospitals", "hrsa_hc", "npi"],
+        )
+        assert len(result) == 1
+        assert result["facility_name"].iloc[0] == "HIFLD Name"
+
+    def test_fuzzy_name_match_within_radius_merges(self):
+        """Two records ~800m apart with fuzzy-similar names should collapse
+        when the fuzzy-name radius is large enough."""
+        a = self._mk("hifld_hospitals", "Geisinger Medical Center", -76.60, 41.00)
+        # ~1 km away — beyond the 250m spatial threshold but within the
+        # 1500m fuzzy-name radius — with a near-identical name.
+        b = self._mk("hrsa_hc", "Geisinger Med Center", -76.60, 41.009)
+        result = cross_reference_sources(a, b, priority=["hifld_hospitals", "hrsa_hc"])
+        assert len(result) == 1
+
+    def test_far_apart_records_do_not_merge(self):
+        a = self._mk(
+            "hifld_hospitals",
+            "Hospital X",
+            -76.60,
+            41.00,
+            address="100 Center St",
+            city="Williamsport",
+            zip_="17701",
+        )
+        b = self._mk(
+            "hrsa_hc",
+            "Hospital X",
+            -80.00,
+            40.44,
+            address="200 Liberty Ave",
+            city="Pittsburgh",
+            zip_="15222",
+        )
+        result = cross_reference_sources(a, b, priority=["hifld_hospitals", "hrsa_hc"])
+        assert len(result) == 2
+
+    def test_provider_count_sums_across_matched_sources(self):
+        a = gpd.GeoDataFrame(
+            {
+                "facility_name": ["Mt Nittany"],
+                "address": ["1800 E Park Ave"],
+                "city": ["State College"],
+                "state": ["PA"],
+                "zip": ["16803"],
+                "provider_count": [260.0],
+                "source": ["hifld_hospitals"],
+            },
+            geometry=[Point(-77.85, 40.79)],
+            crs="EPSG:4326",
+        )
+        b = gpd.GeoDataFrame(
+            {
+                "facility_name": ["Mt Nittany"],
+                "address": ["1800 E Park Ave"],
+                "city": ["State College"],
+                "state": ["PA"],
+                "zip": ["16803"],
+                "provider_count": [15.0],
+                "source": ["npi"],
+            },
+            geometry=[Point(-77.850001, 40.790001)],
+            crs="EPSG:4326",
+        )
+        result = cross_reference_sources(a, b, priority=["hifld_hospitals", "npi"])
+        assert len(result) == 1
+        assert result["provider_count"].iloc[0] >= 260.0
+
+    def test_empty_sources_filtered_out(self):
+        hifld = self._mk("hifld_hospitals", "Hospital A", -76.60, 41.00)
+        empty = gpd.GeoDataFrame(columns=["geometry", "source"], geometry="geometry", crs="EPSG:4326")
+        result = cross_reference_sources(hifld, empty, empty, priority=["hifld_hospitals"])
+        assert len(result) == 1
+        assert result["facility_name"].iloc[0] == "Hospital A"

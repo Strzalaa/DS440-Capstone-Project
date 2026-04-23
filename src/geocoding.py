@@ -206,6 +206,7 @@ def geocode_facilities(
     city_col: str = "city",
     state_col: str = "state",
     zip_col: str = "zip",
+    batch_only: bool = False,
 ) -> gpd.GeoDataFrame:
     """Geocode facility addresses to point geometries.
 
@@ -218,6 +219,11 @@ def geocode_facilities(
         Raw facility records.
     address_col, city_col, state_col, zip_col : str
         Column names for address components.
+    batch_only : bool
+        When True, only the Census batch geocoder is used; the slow
+        per-address Census single-line and Nominatim fallbacks are skipped.
+        Useful for large gap-fill sources (e.g. NPI with thousands of rows
+        that will mostly be deduplicated against pre-geocoded layers).
 
     Returns
     -------
@@ -255,7 +261,9 @@ def geocode_facilities(
         still_missing = df["latitude"].isna() | df["longitude"].isna()
         n_still = still_missing.sum()
         print(f"  Batch geocoded {n_missing - n_still} / {n_missing} facilities")
-        if n_still > 0:
+        if batch_only and n_still > 0:
+            print(f"  batch_only=True: skipping per-address fallbacks ({n_still} remaining ungeocoded)")
+        if n_still > 0 and not batch_only:
             print(f"  Census single-address fallback for {n_still} remaining...")
             census_cache: dict[str, tuple[Optional[float], Optional[float]]] = {}
             before_census = n_still
@@ -277,7 +285,7 @@ def geocode_facilities(
             n_still = still_missing.sum()
             print(f"  Census fallback geocoded {before_census - n_still} additional facilities")
 
-        if n_still > 0:
+        if n_still > 0 and not batch_only:
             print(f"  Nominatim fallback for {n_still} remaining...")
             nominatim_cache: dict[str, tuple[Optional[float], Optional[float]]] = {}
             for idx in df.index[still_missing]:
@@ -404,76 +412,274 @@ def validate_coordinates(
     )
 
 
+def _normalise_name_for_match(name: str) -> str:
+    """Lowercase + strip noise words to improve name-based duplicate detection."""
+    if not isinstance(name, str):
+        return ""
+    text = name.lower()
+    noise = [
+        " inc.",
+        " inc",
+        " llc",
+        " pc",
+        " p.c.",
+        ", inc",
+        ", inc.",
+        " corp",
+        " corporation",
+        " medical center",
+        " med ctr",
+        " medical ctr",
+        " hospital",
+        " hosp",
+        " health system",
+        " the ",
+        "'s",
+    ]
+    for token in noise:
+        text = text.replace(token, " ")
+    return " ".join(text.split()).strip()
+
+
+def _fuzzy_name_similarity(a: str, b: str) -> float:
+    """Return a 0..1 similarity score between two facility names.
+
+    Uses ``rapidfuzz.token_set_ratio`` when available; falls back to a
+    difflib ratio when rapidfuzz isn't installed, to keep the merge working
+    in lean test environments.
+    """
+    a_norm = _normalise_name_for_match(a)
+    b_norm = _normalise_name_for_match(b)
+    if not a_norm or not b_norm:
+        return 0.0
+    try:
+        from rapidfuzz import fuzz
+
+        return float(fuzz.token_set_ratio(a_norm, b_norm)) / 100.0
+    except Exception:
+        import difflib
+
+        return difflib.SequenceMatcher(None, a_norm, b_norm).ratio()
+
+
 def cross_reference_sources(
-    cms_facilities: gpd.GeoDataFrame,
-    hrsa_facilities: gpd.GeoDataFrame,
-    match_threshold_m: float = 500.0,
+    *source_gdfs: gpd.GeoDataFrame,
+    priority: Optional[list[str]] = None,
+    match_threshold_m: float = 250.0,
+    name_similarity_threshold: float = 0.85,
+    name_match_radius_m: float = 1500.0,
 ) -> gpd.GeoDataFrame:
-    """Merge CMS and HRSA datasets, de-duplicate by spatial proximity.
+    """Merge N facility source datasets with spatial + fuzzy-name deduplication.
 
     Parameters
     ----------
-    cms_facilities : gpd.GeoDataFrame
-        CMS Provider of Services records.
-    hrsa_facilities : gpd.GeoDataFrame
-        HRSA Health Center records.
+    *source_gdfs : gpd.GeoDataFrame
+        Two or more geocoded facility frames. Each frame should carry a
+        ``source`` column (populated by ``_normalise_facility_columns``). The
+        frames are merged in priority order, where the first matching record
+        from a higher-priority source wins.
+    priority : list[str] | None
+        Explicit ordering of ``source`` labels (highest priority first). When
+        ``None`` the positional order of ``source_gdfs`` is used.
     match_threshold_m : float
-        Maximum distance (metres) to consider two records the same facility.
+        Spatial match radius in metres. Defaults to 250 m because the
+        pre-geocoded HIFLD / HRSA layers have rooftop-accurate coordinates.
+    name_similarity_threshold : float
+        Minimum token-set similarity (0..1) to treat two records as the same
+        facility when their coordinates fall within ``name_match_radius_m``.
+    name_match_radius_m : float
+        Fuzzy-name radius (metres). Names are only compared when the two
+        candidate records are already within this distance.
 
     Returns
     -------
     gpd.GeoDataFrame
-        Unified facility dataset with source provenance column.
+        Unified facility dataset with a ``source_provenance`` column listing
+        every source that contributed a matched record (for example
+        ``"hifld_hospitals+hrsa_hc"``).
+
+    Notes
+    -----
+    Legacy signature ``cross_reference_sources(cms_gdf, hrsa_gdf)`` still
+    works: when exactly two positional GeoDataFrames are passed and no
+    ``priority`` is given, they are treated as CMS-first, HRSA-second.
     """
-    cms = cms_facilities.copy()
-    hrsa = hrsa_facilities.copy()
-
-    if cms.empty and hrsa.empty:
-        return gpd.GeoDataFrame(columns=["source_provenance", "geometry"], geometry="geometry", crs="EPSG:4326")
-    if cms.empty:
-        out = hrsa.copy()
-        out["source_provenance"] = "hrsa"
-        return _deduplicate_facilities(out)
-    if hrsa.empty:
-        out = cms.copy()
-        out["source_provenance"] = "cms"
-        return _deduplicate_facilities(out)
-
-    cms = cms.to_crs(4326)
-    hrsa = hrsa.to_crs(4326)
-    cms["cms_idx"] = cms.index
-    hrsa["hrsa_idx"] = hrsa.index
-
-    cms_valid = cms[cms.geometry.notna() & ~cms.geometry.is_empty].copy()
-    hrsa_valid = hrsa[hrsa.geometry.notna() & ~hrsa.geometry.is_empty].copy()
-
-    matched_hrsa_idxs: set[int] = set()
-    if not cms_valid.empty and not hrsa_valid.empty:
-        cms_3857 = cms_valid.to_crs(3857)
-        hrsa_3857 = hrsa_valid.to_crs(3857)
-        nearest = gpd.sjoin_nearest(
-            cms_3857,
-            hrsa_3857[["hrsa_idx", "geometry"]],
-            how="left",
-            max_distance=match_threshold_m,
-            distance_col="match_distance_m",
+    sources = [gdf for gdf in source_gdfs if gdf is not None]
+    if not sources:
+        return gpd.GeoDataFrame(
+            columns=["source_provenance", "geometry"],
+            geometry="geometry",
+            crs="EPSG:4326",
         )
-        nearest_dedup = nearest[~nearest.index.duplicated(keep="first")]
-        matched_hrsa_idxs = set(nearest_dedup["hrsa_idx"].dropna().astype(int).tolist())
-        match_mask = nearest_dedup["hrsa_idx"].notna()
-        cms.loc[match_mask.index[match_mask], "source_provenance"] = "cms+hrsa"
 
-    merged = cms.copy()
-    if "source_provenance" not in merged.columns:
-        merged["source_provenance"] = "cms"
-    merged["source_provenance"] = merged["source_provenance"].fillna("cms")
+    # Back-compat: the legacy 2-positional-arg signature was
+    # ``cross_reference_sources(cms_gdf, hrsa_gdf)``. When exactly two frames
+    # are passed without a ``source`` column and no explicit priority, default
+    # the labels to "cms" and "hrsa" so historical callers and tests keep
+    # working.
+    legacy_mode = (
+        len(sources) == 2
+        and priority is None
+        and not any(
+            "source" in gdf.columns and gdf["source"].notna().any() for gdf in sources
+        )
+    )
+    default_legacy_labels = ["cms", "hrsa"]
 
-    unmatched_hrsa = hrsa.loc[~hrsa["hrsa_idx"].isin(matched_hrsa_idxs)].copy()
-    unmatched_hrsa["source_provenance"] = "hrsa"
+    labelled: list[tuple[str, gpd.GeoDataFrame]] = []
+    for idx, gdf in enumerate(sources):
+        if gdf.empty:
+            continue
+        if "source" in gdf.columns and gdf["source"].notna().any():
+            label = str(gdf["source"].dropna().iloc[0])
+        elif legacy_mode and idx < len(default_legacy_labels):
+            label = default_legacy_labels[idx]
+        else:
+            label = f"source_{idx}"
+        labelled.append((label, gdf.copy()))
 
-    out = pd.concat([merged, unmatched_hrsa], ignore_index=True, sort=False)
-    for drop_col in ["cms_idx", "hrsa_idx"]:
-        if drop_col in out.columns:
-            out = out.drop(columns=[drop_col])
-    out_gdf = gpd.GeoDataFrame(out, geometry="geometry", crs="EPSG:4326")
-    return _deduplicate_facilities(out_gdf)
+    if not labelled:
+        return gpd.GeoDataFrame(
+            columns=["source_provenance", "geometry"],
+            geometry="geometry",
+            crs="EPSG:4326",
+        )
+
+    if priority is None:
+        priority = [label for label, _ in labelled]
+    order = {label: rank for rank, label in enumerate(priority)}
+    labelled.sort(key=lambda pair: order.get(pair[0], len(priority)))
+
+    merged_records: list[pd.DataFrame] = []
+    accepted_3857: Optional[gpd.GeoDataFrame] = None
+
+    for label, gdf in labelled:
+        working = gdf.to_crs(4326).copy()
+        if "source_provenance" not in working.columns:
+            working["source_provenance"] = label
+
+        if accepted_3857 is None or accepted_3857.empty:
+            merged_records.append(working)
+            accepted_3857 = working.to_crs(3857) if not working.empty else None
+            continue
+
+        working_valid = working[
+            working.geometry.notna() & ~working.geometry.is_empty
+        ].copy()
+        working_no_geom = working.loc[
+            working.geometry.isna() | working.geometry.is_empty
+        ].copy()
+
+        if working_valid.empty:
+            merged_records.append(working_no_geom)
+            continue
+
+        working_3857 = working_valid.to_crs(3857).copy()
+        working_3857["__new_idx"] = range(len(working_3857))
+
+        accepted_reset = accepted_3857.reset_index(drop=True).copy()
+        accepted_reset["__acc_idx"] = range(len(accepted_reset))
+
+        nearest = gpd.sjoin_nearest(
+            working_3857,
+            accepted_reset[["__acc_idx", "facility_name", "geometry"]]
+            .rename(columns={"facility_name": "__acc_name"}),
+            how="left",
+            max_distance=name_match_radius_m,
+            distance_col="__match_distance_m",
+        )
+        nearest = nearest[~nearest["__new_idx"].duplicated(keep="first")]
+
+        duplicate_mask: list[bool] = []
+        matched_acc_for_row: list[Optional[int]] = []
+        for _, row in nearest.iterrows():
+            dist = row.get("__match_distance_m")
+            acc_idx = row.get("__acc_idx")
+            if pd.isna(acc_idx) or pd.isna(dist):
+                duplicate_mask.append(False)
+                matched_acc_for_row.append(None)
+                continue
+            acc_idx_int = int(acc_idx)
+            if float(dist) <= match_threshold_m:
+                duplicate_mask.append(True)
+                matched_acc_for_row.append(acc_idx_int)
+                continue
+            if float(dist) <= name_match_radius_m:
+                new_name = row.get("facility_name", "")
+                acc_name = row.get("__acc_name", "")
+                if (
+                    _fuzzy_name_similarity(new_name, acc_name)
+                    >= name_similarity_threshold
+                ):
+                    duplicate_mask.append(True)
+                    matched_acc_for_row.append(acc_idx_int)
+                    continue
+            duplicate_mask.append(False)
+            matched_acc_for_row.append(None)
+
+        nearest["__is_duplicate"] = duplicate_mask
+        nearest["__matched_acc_idx"] = matched_acc_for_row
+
+        duplicates = nearest[nearest["__is_duplicate"]]
+        if not duplicates.empty:
+            accepted_reset = accepted_reset.set_index("__acc_idx")
+            for acc_idx_int, dup_group in duplicates.groupby("__matched_acc_idx"):
+                if acc_idx_int is None:
+                    continue
+                existing_prov = accepted_reset.at[int(acc_idx_int), "source_provenance"]
+                combined = sorted(
+                    {
+                        *str(existing_prov or "").split("+"),
+                        label,
+                    }
+                )
+                combined = [c for c in combined if c]
+                accepted_reset.at[int(acc_idx_int), "source_provenance"] = "+".join(
+                    combined
+                )
+                if "provider_count" in accepted_reset.columns:
+                    extra = pd.to_numeric(
+                        dup_group.get("provider_count"), errors="coerce"
+                    ).fillna(0).sum()
+                    accepted_reset.at[int(acc_idx_int), "provider_count"] = float(
+                        accepted_reset.at[int(acc_idx_int), "provider_count"] or 0.0
+                    ) + float(extra)
+            accepted_reset = accepted_reset.reset_index()
+
+        new_unique_idxs = nearest.loc[~nearest["__is_duplicate"], "__new_idx"].tolist()
+        new_unique = working_valid.reset_index(drop=True).loc[new_unique_idxs].copy()
+
+        # Rebuild merged_records + accepted_3857 from accepted_reset and
+        # append new unique rows + geometry-less rows for this source.
+        merged_records = [
+            accepted_reset.drop(columns=["__acc_idx"], errors="ignore").to_crs(4326)
+        ]
+        merged_records.append(new_unique)
+        if not working_no_geom.empty:
+            merged_records.append(working_no_geom)
+
+        combined_so_far = pd.concat(merged_records, ignore_index=True, sort=False)
+        combined_gdf = gpd.GeoDataFrame(
+            combined_so_far, geometry="geometry", crs="EPSG:4326"
+        )
+        accepted_3857 = combined_gdf[
+            combined_gdf.geometry.notna() & ~combined_gdf.geometry.is_empty
+        ].to_crs(3857)
+        merged_records = [combined_gdf]
+
+    if not merged_records:
+        return gpd.GeoDataFrame(
+            columns=["source_provenance", "geometry"],
+            geometry="geometry",
+            crs="EPSG:4326",
+        )
+
+    final = pd.concat(merged_records, ignore_index=True, sort=False)
+    drop_cols = [
+        c
+        for c in final.columns
+        if c.startswith("__") or c in {"index_right", "match_distance_m"}
+    ]
+    final = final.drop(columns=drop_cols, errors="ignore")
+    final_gdf = gpd.GeoDataFrame(final, geometry="geometry", crs="EPSG:4326")
+    return _deduplicate_facilities(final_gdf)

@@ -103,4 +103,46 @@ DATA_URLS: dict[str, str] = {
     ),
     "hrsa_health_centers": "https://data.hrsa.gov/data/download",
     "cms_pos": "https://data.cms.gov/",
+    # HRSA's gisportal hosts the canonical CMS-approved facility registry.
+    # The HIFLD hosted feature layer was deactivated in August 2025, so we
+    # repoint the hospital / urgent-care tiers at HRSA which sources the
+    # same CMS Provider of Services data at the layer level.
+    #
+    # Layer 1  = Hospitals (CMS approved, short-term acute & specialty)
+    # Layer 2  = Critical Access Hospitals
+    # Layer 4  = Rural Health Clinics
+    # Layer 7  = Ambulatory Surgical Centers
+    # Layer 18 = Health Center Service Delivery Sites (FQHC / Look-Alike)
+    # Layer 19 = Health Center Look-Alike Sites
+    "hifld_hospitals": (
+        "https://gisportal.hrsa.gov/server/rest/services/HealthCareFacilities/"
+        "HealthCareFacilities/MapServer/1/query"
+    ),
+    "hrsa_critical_access_hospitals": (
+        "https://gisportal.hrsa.gov/server/rest/services/HealthCareFacilities/"
+        "HealthCareFacilities/MapServer/2/query"
+    ),
+    "hrsa_rural_health_clinics": (
+        "https://gisportal.hrsa.gov/server/rest/services/HealthCareFacilities/"
+        "HealthCareFacilities/MapServer/4/query"
+    ),
+    "hifld_urgent_care": (
+        "https://gisportal.hrsa.gov/server/rest/services/HealthCareFacilities/"
+        "HealthCareFacilities/MapServer/7/query"
+    ),
+    "hrsa_hc_geojson": (
+        "https://gisportal.hrsa.gov/server/rest/services/HealthCareFacilities/"
+        "HealthCareFacilities/MapServer/18/query"
+    ),
+    "hrsa_lookalike_sites": (
+        "https://gisportal.hrsa.gov/server/rest/services/HealthCareFacilities/"
+        "HealthCareFacilities/MapServer/19/query"
+    ),
+    # CMS Provider of Services file (hospital + non-hospital facilities, CSV).
+    # Endpoint intentionally points at a placeholder; the loader falls back to
+    # a locally staged CSV when the direct download URL is unavailable.
+    "cms_pos_csv": (
+        "https://data.cms.gov/provider-of-services/provider-of-services-file-"
+        "hospital-non-hospital-facilities/data.csv"
+    ),
 }
