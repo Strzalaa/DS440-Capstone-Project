@@ -15,6 +15,8 @@ import statsmodels.api as sm
 from esda import Moran, Moran_Local
 from libpysal.weights import Queen
 
+from src.svi import mask_svi_percentile
+
 
 def run_ols_regression(
     data: gpd.GeoDataFrame,
@@ -50,8 +52,12 @@ def run_ols_regression(
     if not predictors:
         raise ValueError("No independent variables available for OLS.")
 
+    work = data.copy()
+    if "svi_overall" in work.columns:
+        work["svi_overall"] = mask_svi_percentile(work["svi_overall"])
+
     cols = [dependent_var, *predictors]
-    clean = data[cols].replace([np.inf, -np.inf], np.nan).dropna()
+    clean = work[cols].replace([np.inf, -np.inf], np.nan).dropna()
     if clean.empty:
         raise ValueError("No valid rows remain after dropping missing values.")
 
@@ -125,6 +131,9 @@ def run_gwr(
         raise ValueError("No independent variables available for GWR.")
 
     work = data.copy()
+    if "svi_overall" in work.columns:
+        work["svi_overall"] = mask_svi_percentile(work["svi_overall"])
+    # Project before centroids so polygon centroids are in planar coordinates.
     work = work.to_crs(3857)
     if not all(work.geometry.geom_type == "Point"):
         work["geometry"] = work.geometry.centroid
