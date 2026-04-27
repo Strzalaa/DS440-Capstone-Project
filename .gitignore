@@ -19,10 +19,6 @@ data/outputs/*
 *.zip
 *.tar.gz
 
-# Allow specific deployment data files (needed by the live dashboard)
-!data/outputs/pa_accessibility_clusters.gpkg
-!data/processed/pa_facilities.gpkg
-
 # Tabular data
 *.csv
 *.xlsx

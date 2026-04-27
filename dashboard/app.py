@@ -132,7 +132,6 @@ def _cluster_profile_table_block():
 # ---------------------------------------------------------------------------
 
 app = Dash(__name__, title="Healthcare Access Dashboard")
-server = app.server  # expose Flask server for gunicorn
 
 METRIC_OPTIONS = [
     {"label": "Accessibility Score (E2SFCA)", "value": "accessibility_score"},
@@ -485,6 +484,4 @@ def _build_scatter(metric, overlay, is_categorical):
 
 
 if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", 8050))
-    app.run(debug=False, host="0.0.0.0", port=port)
+    app.run(debug=True)
