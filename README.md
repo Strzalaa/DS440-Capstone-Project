@@ -8,7 +8,7 @@ DS 440 Capstone Project — Group 24
 |---|---|
 | Nathan Kizlinski | Team Member |
 | Eric Strzalkowski | Team Member |
-| Cameron Moore | LIL GUY |
+| Cameron Moore | Team Member |
 | Rishi Nair | Team Member |
 | Zack Ranjan | Team Member |
 
